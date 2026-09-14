@@ -20,6 +20,7 @@ use theme::{TextStyle, Theme, Typeset};
 use crate::{
     block,
     doc::{Align, Block, BlockKind, Doc, Form, Mark, Part, Text},
+    layout::Layout,
     preview,
     select::{Cursor, Selection},
     typography::Typography,
@@ -33,7 +34,7 @@ const INDENT_WIDTH: f32 = 22.0;
 /// The marker column of a list row.
 const MARKER_WIDTH: f32 = 18.0;
 const MARKER_GAP: f32 = 8.0;
-/// A fence's height is `lines × the code leading` plus this padding.
+/// What a fence holds its code in, inside its border.
 const CODE_PADDING_X: f32 = 12.0;
 const CODE_PADDING_Y: f32 = 10.0;
 /// What a fence with no info string calls itself, in its header and in a
@@ -257,6 +258,41 @@ impl BlockLayouts {
             .layout
             .position_for_index(at.offset - painted.range.start)?;
         Some((point, painted.layout.line_height()))
+    }
+
+    /// The painted rows of a range, in document order — what a bar centred over
+    /// a selection is placed against, and what a highlight of a caller's own is
+    /// drawn from.
+    ///
+    /// One rect per visual row rather than one box: a selection that wraps or
+    /// crosses blocks has no single box, and a caller given one would paint
+    /// over the gaps.
+    pub fn rects(&self, selection: Selection) -> Vec<Bounds<Pixels>> {
+        let (start, end) = selection.ordered();
+        self.0
+            .borrow()
+            .texts
+            .iter()
+            .filter_map(|painted| {
+                let here = Cursor::new(painted.block, painted.part, 0);
+                let (from, to) = (
+                    Cursor::new(start.block, start.part, 0),
+                    Cursor::new(end.block, end.part, 0),
+                );
+                if here < from || here > to {
+                    return None;
+                }
+                // The offsets only matter at the two ends: in between, the
+                // whole of the text is covered.
+                let len = painted.range.len();
+                let first = if here == from { start.offset } else { 0 };
+                let last = if here == to { end.offset } else { usize::MAX };
+                let range = first.saturating_sub(painted.range.start).min(len)
+                    ..last.saturating_sub(painted.range.start).min(len);
+                (range.start < range.end).then(|| range_rects(&painted.layout, &range, 0.0, 0.0))
+            })
+            .flatten()
+            .collect()
     }
 
     /// The position one painted row above or below `at`, and the row it landed
@@ -527,7 +563,8 @@ impl<'a> Overlay<'a> {
 
 /// Parse and render in one step — the common case for read-only content.
 pub fn markdown(source: &str, window: &mut Window, cx: &mut App) -> AnyElement {
-    render(&crate::parse(source), Caption::default(), window, cx)
+    let doc = crate::parse_with(source, &crate::Marks::of(cx));
+    render(&doc, Caption::default(), window, cx)
 }
 
 /// Render a document.
@@ -668,6 +705,7 @@ fn block_element(
             FontWeight::NORMAL,
             body,
             theme,
+            cx,
         ),
         BlockKind::Heading { level, text } => {
             let heading = typography.heading(*level);
@@ -678,10 +716,11 @@ fn block_element(
                 heading.weight,
                 body,
                 theme,
+                cx,
             )
         }
         BlockKind::Bullet(text) => {
-            marker_row(disc(typography, theme), text, body, typography, theme)
+            marker_row(disc(typography, theme), text, body, typography, theme, cx)
         }
         BlockKind::Ordered { number, text } => marker_row(
             div()
@@ -696,6 +735,7 @@ fn block_element(
             body,
             typography,
             theme,
+            cx,
         ),
         BlockKind::Task { checked, text } => marker_row(
             checkbox(*checked, typography, theme),
@@ -703,6 +743,7 @@ fn block_element(
             body,
             typography,
             theme,
+            cx,
         ),
         BlockKind::Quote(text) => div()
             .border_l_2()
@@ -718,6 +759,7 @@ fn block_element(
                 FontWeight::NORMAL,
                 body,
                 theme,
+                cx,
             ))
             .into_any_element(),
         BlockKind::Code { language, code } => {
@@ -750,7 +792,9 @@ fn block_element(
                 ),
             }
         }
-        BlockKind::Image { url, alt, width } => image(url, alt, *width, overlay, typography, theme),
+        BlockKind::Image { url, alt, width } => {
+            image(url, alt, *width, overlay, typography, theme, cx)
+        }
         BlockKind::Bookmark { url, form } => {
             bookmark(overlay.block, url, *form, typography, theme, cx)
         }
@@ -758,7 +802,7 @@ fn block_element(
             align,
             header,
             rows,
-        } => table(align, header, rows, overlay, typography, theme, window),
+        } => table(align, header, rows, overlay, typography, theme, window, cx),
         BlockKind::Rule => div()
             .h(px(1.0))
             .w_full()
@@ -821,6 +865,7 @@ fn marker_row(
     overlay: Overlay,
     typography: &Typography,
     theme: &Theme,
+    cx: &App,
 ) -> AnyElement {
     div()
         .flex()
@@ -834,6 +879,7 @@ fn marker_row(
             FontWeight::NORMAL,
             overlay,
             theme,
+            cx,
         )))
         .into_any_element()
 }
@@ -851,6 +897,17 @@ pub struct Flat {
 /// Marks are ranges, gpui wants consecutive runs — so cut the text at every
 /// mark boundary and ask which marks cover each piece.
 pub fn flatten(text: &Text, base_weight: FontWeight, theme: &Theme) -> Flat {
+    flatten_with(text, base_weight, theme, |_| None)
+}
+
+/// [`flatten`] with the app's own marks painted — see [`crate::MarkPaint`]. A
+/// name the app does not paint reads as the text it wraps.
+pub fn flatten_with(
+    text: &Text,
+    base_weight: FontWeight,
+    theme: &Theme,
+    paint: impl Fn(&str) -> Option<crate::MarkPaint>,
+) -> Flat {
     let mut cuts: Vec<usize> = text
         .marks
         .iter()
@@ -876,6 +933,9 @@ pub fn flatten(text: &Text, base_weight: FontWeight, theme: &Theme) -> Flat {
         let (mut bold, mut italic, mut mono, mut strike) = (false, false, false, false);
         let mut chip = false;
         let mut link = None;
+        // The app's own marks, merged in the order they cover this run: the
+        // last one to say something about a field is the one that says it.
+        let mut custom = crate::MarkPaint::default();
         for span in covering {
             match &span.mark {
                 Mark::Bold => bold = true,
@@ -887,8 +947,18 @@ pub fn flatten(text: &Text, base_weight: FontWeight, theme: &Theme) -> Flat {
                     link = Some(url.clone());
                 }
                 Mark::Link(url) | Mark::Image(url) => link = Some(url.clone()),
+                Mark::Custom(name) => {
+                    let Some(painted) = paint(name) else { continue };
+                    custom.color = painted.color.or(custom.color);
+                    custom.background = painted.background.or(custom.background);
+                    custom.weight = painted.weight.or(custom.weight);
+                    custom.italic |= painted.italic;
+                    custom.underline |= painted.underline;
+                    custom.strikethrough |= painted.strikethrough;
+                }
             }
         }
+        let (italic, strike) = (italic || custom.italic, strike || custom.strikethrough);
 
         if mono {
             match code.last_mut() {
@@ -917,7 +987,7 @@ pub fn flatten(text: &Text, base_weight: FontWeight, theme: &Theme) -> Flat {
         face.weight = if bold && base_weight.0 < FontWeight::SEMIBOLD.0 {
             FontWeight::SEMIBOLD
         } else {
-            base_weight
+            custom.weight.unwrap_or(base_weight)
         };
         face.style = if italic {
             FontStyle::Italic
@@ -931,9 +1001,13 @@ pub fn flatten(text: &Text, base_weight: FontWeight, theme: &Theme) -> Flat {
             // Links stay monochrome and underlined; the accent is reserved for
             // primary actions. A chip carries its own wash, so underlining it
             // too would say the same thing twice.
-            color: if mono { theme.code_text } else { theme.text },
-            background_color: None,
-            underline: (link.is_some() && !chip).then_some(UnderlineStyle {
+            color: match (mono, custom.color) {
+                (_, Some(color)) => color,
+                (true, None) => theme.code_text,
+                (false, None) => theme.text,
+            },
+            background_color: custom.background,
+            underline: ((link.is_some() && !chip) || custom.underline).then_some(UnderlineStyle {
                 color: Some(theme.text_muted),
                 thickness: px(1.0),
                 wavy: false,
@@ -961,8 +1035,11 @@ fn text_element(
     weight: FontWeight,
     overlay: Overlay,
     theme: &Theme,
+    cx: &App,
 ) -> AnyElement {
-    let flat = flatten(text, weight, theme);
+    let flat = flatten_with(text, weight, theme, |name| {
+        crate::marks::paint_of(cx, name, theme)
+    });
     painted_text(flat, text.text.len(), size, line_height, overlay, theme)
 }
 
@@ -1172,20 +1249,79 @@ fn range_rects(
     rects
 }
 
-fn code_block(
+/// Paint a document's own markdown source: a fence's caret, selection and hit
+/// testing, without a fence's box, band or copy button.
+///
+/// The caret is a [`Cursor`] at block 0 in [`Part::Code`] — what a document
+/// held as one fence answers to, which is how an editor holds its source.
+/// Wrapping is not optional here: a paragraph is one line of markdown, and a
+/// source view that scrolled sideways would hide most of it.
+pub fn render_source(code: &str, editing: Editing, cx: &mut App) -> AnyElement {
+    let Editing {
+        selection,
+        caret_on,
+        layouts,
+        annotations,
+        typography,
+        ..
+    } = editing;
+    // The same reset `render_with` opens with, and for the same reason: the
+    // positions this frame records are the ones the next click resolves
+    // against, and last frame's have to go first.
+    let reset = layouts.map(|layouts| {
+        let layouts = layouts.clone();
+        canvas(move |_, _, _| layouts.clear(), |_, _, _, _| ())
+            .absolute()
+            .size(px(0.0))
+    });
+    let theme = Theme::of(cx).clone();
+    let typography = typography.unwrap_or_else(|| Typography::of(cx));
+    let overlay = Overlay {
+        block: 0,
+        part: Part::Code,
+        selection,
+        caret_on,
+        layouts,
+        annotations,
+        placeholder: None,
+        caption: Caption::default(),
+    };
+    let (underlay, lines) = code_lines(
+        Some(crate::source::LANGUAGES[0]),
+        code,
+        overlay,
+        &typography,
+        &theme,
+        cx,
+    );
+    div()
+        .flex()
+        .flex_col()
+        .children(reset)
+        .child(code_body(0, underlay, lines, &typography, true))
+        .into_any_element()
+}
+
+/// The shaped lines of a fence, and the canvas that paints the caret, the
+/// selection and the annotations over them.
+fn code_lines(
     language: Option<&str>,
     code: &str,
     overlay: Overlay,
     typography: &Typography,
     theme: &Theme,
-    window: &mut Window,
-    cx: &mut App,
-) -> AnyElement {
+    cx: &App,
+) -> (AnyElement, Vec<AnyElement>) {
     let ix = overlay.block;
-    // Per line, so the block's height is exactly `lines × line height`.
     // Highlighting recolors runs only — layout does not move, so a build with
     // no highlighter installed paints the same block in one plain run.
-    let spans = crate::highlight::spans(cx, language, code);
+    // Markdown is the one language this crate can colour on its own, which is
+    // what a source view is painted with where no highlighter reaches.
+    let spans = crate::highlight::spans(cx, language, code).or_else(|| {
+        language
+            .filter(|language| crate::source::is_markdown(language))
+            .map(|_| crate::source::spans(code))
+    });
     let mono = font(theme.font_mono.clone());
     let run = |len: usize, color: Hsla| TextRun {
         len,
@@ -1195,8 +1331,10 @@ fn code_block(
         underline: None,
         strikethrough: None,
     };
-    // Each line's own layout, with the slice of the code it covers — the caret
-    // and a click both resolve through these.
+    // Each source line's own layout, with the slice of the code it covers —
+    // the caret and a click both resolve through these. A wrapped line is
+    // several rows of one layout, which is the case `range_rects` already
+    // walks for a paragraph.
     let mut rows: Vec<(Range<usize>, TextLayout)> = Vec::new();
     let mut offset = 0usize;
     let lines: Vec<AnyElement> = code
@@ -1297,6 +1435,22 @@ fn code_block(
     .absolute()
     .size_full();
 
+    (underlay.into_any_element(), lines)
+}
+
+fn code_block(
+    language: Option<&str>,
+    code: &str,
+    overlay: Overlay,
+    typography: &Typography,
+    theme: &Theme,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let ix = overlay.block;
+    let (underlay, lines) = code_lines(language, code, overlay, typography, theme, cx);
+    let body = code_body(ix, underlay, lines, typography, Layout::of(cx).wrap_code);
+
     div()
         .rounded(px(Theme::panel_radius()))
         .bg(theme.ink(0.035))
@@ -1343,38 +1497,53 @@ fn code_block(
                         )),
                 ),
         )
-        .child(
-            contain_sideways(div().id(ElementId::named_usize("md-code", ix)))
-                .overflow_x_scroll()
-                // Without it a scroll down the page turns sideways the moment
-                // the pointer crosses a code block: gpui remaps input to
-                // whichever axis a container can scroll.
-                .restrict_scroll_to_axis()
-                .relative()
-                .flex()
-                .flex_row()
-                .py(px(CODE_PADDING_Y))
-                .text_size(px(typography.code.size()))
-                .line_height(px(typography.code.line_height()))
-                .whitespace_nowrap()
-                .child(underlay)
-                .child(
-                    // The padding belongs to the lines, not to the scroller: a
-                    // scroll container's trailing padding is not part of what
-                    // it will scroll to, so the last characters of a long line
-                    // sit behind the right edge with nowhere left to go. As a
-                    // row's only item this column is sized by its widest line,
-                    // and the padding rides along inside that width.
-                    div()
-                        .flex()
-                        .flex_col()
-                        .items_start()
-                        .px(px(CODE_PADDING_X))
-                        .children(lines),
-                ),
-        )
+        .child(body)
         .child(copy_button(code, ix, theme, window, cx))
         .into_any_element()
+}
+
+/// The lines of a fence, wrapped to the block or scrolling sideways under it.
+fn code_body(
+    ix: usize,
+    underlay: AnyElement,
+    lines: Vec<AnyElement>,
+    typography: &Typography,
+    wrap: bool,
+) -> gpui::Stateful<gpui::Div> {
+    let column = div()
+        .flex()
+        .flex_col()
+        .px(px(CODE_PADDING_X))
+        .children(lines);
+    let body = div()
+        .id(ElementId::named_usize("md-code", ix))
+        .relative()
+        .py(px(CODE_PADDING_Y))
+        .text_size(px(typography.code.size()))
+        .line_height(px(typography.code.line_height()))
+        .child(underlay);
+    if wrap {
+        // The column is the block's width here rather than its widest line's,
+        // which is what gives the text something to wrap against.
+        body.child(column.w_full())
+    } else {
+        contain_sideways(body)
+            .overflow_x_scroll()
+            // Without it a scroll down the page turns sideways the moment the
+            // pointer crosses a code block: gpui remaps input to whichever axis
+            // a container can scroll.
+            .restrict_scroll_to_axis()
+            .flex()
+            .flex_row()
+            .whitespace_nowrap()
+            // The padding belongs to the lines, not to the scroller: a scroll
+            // container's trailing padding is not part of what it will scroll
+            // to, so the last characters of a long line sit behind the right
+            // edge with nowhere left to go. As a row's only item this column is
+            // sized by its widest line, and the padding rides along inside that
+            // width.
+            .child(column.items_start())
+    }
 }
 
 /// A copy button that owns its own feedback.
@@ -1443,6 +1612,7 @@ fn image(
     overlay: Overlay,
     typography: &Typography,
     theme: &Theme,
+    cx: &App,
 ) -> AnyElement {
     let hint = SharedString::new_static(CAPTION_HINT);
     let overlay = Overlay {
@@ -1518,6 +1688,7 @@ fn image(
                     FontWeight::NORMAL,
                     overlay,
                     theme,
+                    cx,
                 ))
             },
         )
@@ -1715,6 +1886,10 @@ fn initial(host: &str, size: f32, color: Hsla, wash: Hsla) -> AnyElement {
 /// shaped unwrapped to get its max-content width, and the flex resolution does
 /// the rest. When even the floors no longer fit, the table scrolls sideways
 /// rather than crushing every column into per-character wrapping.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a table, its overlay, and what paints them"
+)]
 fn table(
     align: &[Align],
     header: &[Text],
@@ -1723,6 +1898,7 @@ fn table(
     typography: &Typography,
     theme: &Theme,
     window: &mut Window,
+    cx: &App,
 ) -> AnyElement {
     let ix = overlay.block;
     let all: Vec<&[Text]> = std::iter::once(header)
@@ -1750,7 +1926,9 @@ fn table(
                 out.push(None);
                 continue;
             };
-            let flat = flatten(cell, weight, theme);
+            let flat = flatten_with(cell, weight, theme, |name| {
+                crate::marks::paint_of(cx, name, theme)
+            });
             if !flat.text.is_empty() {
                 let width = f32::from(
                     text_system

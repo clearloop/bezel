@@ -33,7 +33,7 @@ use crate::{
 
 pub(crate) mod image;
 mod input;
-mod keys;
+pub mod keys;
 pub(crate) mod menu;
 
 pub use keys::init;
@@ -68,11 +68,96 @@ pub enum EditorEvent {
     Changed,
     /// A click landed on a comment's range.
     CommentActivated(CommentId),
+    /// The editor switched between the document and its source, which a host
+    /// lighting its own toggle has no other way to hear about — the switch can
+    /// come from an undo as well as from the button.
+    ModeChanged(Mode),
+}
+
+/// Which form the document is being edited in.
+///
+/// The trigger is the app's: a button, a menu row, a chord of its own. What is
+/// here is the switch it calls, because the caret, the undo history and the
+/// focus have to survive it, and only the editor owns all three.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mode {
+    /// The document as it reads.
+    #[default]
+    Blocks,
+    /// The markdown a save would write, in one editable text.
+    Source,
+}
+
+/// Which of the editor's own affordances are on.
+///
+/// All of them unless an app says otherwise: a document with nothing
+/// discoverable on it is the wrong default for a library. Turning one off is
+/// for an app that puts its own in the same place — a bar with its own block
+/// menu does not want the gutter handle's as well — rather than for trimming.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Chrome {
+    /// The gutter handle, the menu it opens, and dragging a block by it.
+    pub handle: bool,
+    /// The `/` menu at an empty block.
+    pub slash: bool,
+    /// A fence's language label, and the picker it opens.
+    pub language: bool,
+    /// The menu a pasted URL drops — leave it, or make a card, a chip or the
+    /// picture it points at.
+    pub paste: bool,
+}
+
+impl Default for Chrome {
+    fn default() -> Self {
+        Self {
+            handle: true,
+            slash: true,
+            language: true,
+            paste: true,
+        }
+    }
+}
+
+/// What a toolbar reads to light itself, in one call.
+///
+/// Every field is a question a bar asks on every frame, and each was a separate
+/// reach into the document before: which marks are lit, what the block is
+/// called, whether cmd-E would fence, and whether any of it applies at all.
+/// Taken together so a bar cannot answer half of them from one frame and half
+/// from the next.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Formatting {
+    /// Which form the document is in. In [`Mode::Source`] the markup is already
+    /// spelled out, so [`Self::marks`] is empty and a bar has nothing to light.
+    pub mode: Mode,
+    /// The marks the selection carries throughout — and at a collapsed caret,
+    /// the ones the next character typed would carry, cmd-B before typing
+    /// included.
+    pub marks: Vec<Mark>,
+    /// What the caret's block is called in [`turns`], or `None` for a block the
+    /// menu does not offer.
+    pub block: Option<gpui::SharedString>,
+    /// Whether [`Mark::Code`] here makes a fence out of the selection rather
+    /// than an inline span — the one chord whose meaning changes with what is
+    /// selected, and the one a bar cannot work out for itself.
+    pub fenceable: bool,
+}
+
+/// Every block a block can be turned into, and what each is called — the
+/// vocabulary the slash menu and the block menu both offer, for an app building
+/// a menu of its own. Pair with [`Editor::set_block`], which is what both of
+/// bezel's own menus call.
+pub fn turns() -> Vec<(gpui::SharedString, BlockKind)> {
+    crate::slash::items()
 }
 
 /// Shown on the focused block while it is empty — the only discoverable place
 /// to say that `/` does anything.
 const PLACEHOLDER: &str = "Type / for commands";
+
+/// What tab inserts in the source, where there are no blocks to indent. Two
+/// spaces, which is what markdown's own nesting is written in.
+const INDENT: &str = "  ";
 
 /// Half the caret's blink period — `ui::TextField`'s, which is the 500ms on,
 /// 500ms off macOS itself uses.
@@ -125,6 +210,20 @@ fn ensure_block(doc: &mut Doc) -> bool {
     true
 }
 
+/// The document a source view is edited as: one fence holding the markdown.
+///
+/// A fence rather than a paragraph because a fence is the block whose caret
+/// already behaves like a plain text editor's — Enter is a newline, nothing
+/// typed into it is markup, and its lines are laid out one per source line.
+fn source_doc(source: &str) -> Doc {
+    Doc {
+        blocks: vec![Block::new(BlockKind::Code {
+            language: Some(markdown::source::LANGUAGES[0].to_string()),
+            code: Text::plain(source),
+        })],
+    }
+}
+
 /// One of the two floating menus a block drops — the block it belongs to and
 /// where it hangs. A `Popup` rather than an `Option` for the exit phase, and
 /// for the press note: the card's `on_mouse_down_out` fires on the *press*, so
@@ -133,6 +232,17 @@ pub(crate) type MenuPopup = ui::popover::Popup<(usize, gpui::Point<gpui::Pixels>
 
 pub struct Editor {
     doc: Doc,
+    /// The dialect this document is read and written in — the app's own marks,
+    /// taken once at construction. One editor, one spelling: a document that
+    /// changed dialect between a read and a write would rewrite itself.
+    marks: markdown::Marks,
+    /// Which of the editor's own affordances paint. The app's, so one document
+    /// can carry the lot and another none of it.
+    chrome: Chrome,
+    /// Which form the document is in. In [`Mode::Source`] `doc` is one fenced
+    /// block holding the markdown, so every operation below that is about
+    /// *blocks* asks [`Editor::blocks`] first.
+    mode: Mode,
     /// Collapsed for an ordinary caret, so there is one position here rather
     /// than a caret and a range that can disagree.
     selection: Selection,
@@ -221,14 +331,18 @@ pub struct Editor {
 
 impl Editor {
     pub fn new(source: &str, cx: &mut Context<Self>) -> Self {
-        let mut doc = markdown::parse(source);
+        let marks = markdown::Marks::of(cx);
+        let mut doc = markdown::parse_with(source, &marks);
         ensure_block(&mut doc);
         Self {
+            marks,
             // Clamped, not defaulted: a document opening on a fence or a table
             // has no body at block zero, and a caret claiming one resolves
             // against nothing until something moves it.
             selection: Selection::at(Cursor::default().clamp(&doc)),
             doc,
+            chrome: Chrome::default(),
+            mode: Mode::default(),
             focus_handle: cx.focus_handle(),
             marked: None,
             layouts: BlockLayouts::default(),
@@ -265,6 +379,39 @@ impl Editor {
     /// parked in it.
     pub fn with_undo_limit(mut self, limit: usize) -> Self {
         self.history = History::with_limit(limit);
+        self
+    }
+
+    /// Read and write this document with marks of its own, rather than the ones
+    /// [`markdown::set_marks`] installed. For an app whose editors do not all
+    /// speak the same dialect.
+    pub fn with_marks(mut self, marks: markdown::Marks) -> Self {
+        let source = self.source();
+        self.marks = marks;
+        self.doc = markdown::parse_with(&source, &self.marks);
+        ensure_block(&mut self.doc);
+        self.selection = self.selection.clamp(&self.doc);
+        self
+    }
+
+    /// Which of the editor's own affordances to paint. See [`Chrome`].
+    pub fn with_chrome(mut self, chrome: Chrome) -> Self {
+        self.chrome = chrome;
+        self
+    }
+
+    /// What is painting now, for an app whose own bar mirrors it.
+    pub fn chrome(&self) -> Chrome {
+        self.chrome
+    }
+
+    /// Open in [`Mode::Source`] rather than on the document — an app whose
+    /// editor is a markdown file first. Nothing is recorded: this is where the
+    /// document starts, not a switch to step back over.
+    pub fn with_mode(mut self, mode: Mode) -> Self {
+        if mode != self.mode {
+            self.switch(mode);
+        }
         self
     }
 
@@ -383,7 +530,19 @@ impl Editor {
     /// The head's row only — a selection spanning ten blocks wants its bubble
     /// where the pointer left off, not centred over the whole span. `None` when
     /// nothing is selected or the caret has not painted yet.
+    /// Where everything landed last frame — blocks, pictures, a fence's
+    /// language label, and the row rects of any range.
+    ///
+    /// Handed out whole rather than a method per question: an app placing
+    /// chrome of its own asks the geometry, and which question it needs is not
+    /// this crate's to guess. See [`markdown::BlockLayouts`].
+    pub fn layouts(&self) -> &BlockLayouts {
+        &self.layouts
+    }
+
     pub fn selection_bounds(&self) -> Option<gpui::Bounds<gpui::Pixels>> {
+        // The head alone. A bar centred over the whole selection wants
+        // `layouts().rects(selection)`, which is every painted row of it.
         if self.selection.is_collapsed() {
             return None;
         }
@@ -564,10 +723,16 @@ impl Editor {
         // was about a block that no longer holds only the link.
         self.pasted = None;
         self.history
-            .record(kind, &self.doc, self.selection, &self.anchors);
+            .record(kind, self.mode, &self.doc, self.selection, &self.anchors);
         // A list rather than one: Enter clears a selection *and* splits, and an
         // anchor mapped through only half of that lands in the wrong place.
+        // Source mode maps nothing: its deltas are about one fence, and an
+        // anchor dragged through those would point at the markup. They are
+        // clamped back onto the document on the way out instead.
         for delta in edit(self) {
+            if !self.blocks() {
+                continue;
+            }
             for anchor in &mut self.anchors {
                 anchor.map(&delta);
             }
@@ -576,6 +741,9 @@ impl Editor {
         // the caret belongs at the start of whatever replaces it.
         if ensure_block(&mut self.doc) {
             self.selection = Selection::at(Cursor::default());
+        }
+        if !self.blocks() {
+            self.ensure_source();
         }
         self.history.landed(kind, self.selection);
         // Typing moves the caret as surely as an arrow key does, and a split
@@ -645,11 +813,170 @@ impl Editor {
     }
 
     /// The document as markdown — normalized, because that is the form that
-    /// survives being read back.
+    /// survives being read back. In [`Mode::Source`] it is the text being
+    /// edited, exactly as it stands.
     pub fn source(&self) -> String {
-        let mut doc = self.doc.clone();
-        doc.normalize();
-        markdown::serialize(&doc)
+        match self.mode {
+            Mode::Blocks => {
+                let mut doc = self.doc.clone();
+                doc.normalize_with(&self.marks);
+                markdown::serialize_with(&doc, &self.marks)
+            }
+            Mode::Source => self.source_text().to_string(),
+        }
+    }
+
+    /// Which form the document is being edited in.
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    /// What a toolbar needs to light itself. See [`Formatting`].
+    pub fn formatting(&self) -> Formatting {
+        let at = self.cursor();
+        let marks = if self.blocks() {
+            let mut marks = self.doc.marks(self.selection);
+            // A stored mark is one cmd-B has already taken and nothing has
+            // spent yet, so the button that took it stays lit.
+            for mark in &self.stored {
+                if !marks.contains(mark) {
+                    marks.push(mark.clone());
+                }
+            }
+            marks
+        } else {
+            Vec::new()
+        };
+        Formatting {
+            mode: self.mode,
+            marks,
+            block: self
+                .doc
+                .blocks
+                .get(at.block)
+                .and_then(|block| crate::slash::label(&block.kind)),
+            fenceable: self.blocks() && fenceable(&self.doc, self.selection),
+        }
+    }
+
+    /// Switch between the document and its markdown, carrying the caret across.
+    ///
+    /// One undo step, and one the history knows the mode of: stepping back
+    /// over a switch puts the document back in the form it was edited in.
+    ///
+    /// A comment anchor does not follow an edit made to the source — there are
+    /// no blocks there to anchor to — and is clamped back onto the document on
+    /// the way out.
+    pub fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
+        if mode == self.mode {
+            return;
+        }
+        self.history.record(
+            EditKind::Structure,
+            self.mode,
+            &self.doc,
+            self.selection,
+            &self.anchors,
+        );
+        self.dismiss_menus();
+        self.switch(mode);
+        self.history.landed(EditKind::Structure, self.selection);
+        self.reveal = true;
+        self.caret_moved();
+        cx.emit(EditorEvent::ModeChanged(mode));
+        cx.emit(EditorEvent::Changed);
+        cx.notify();
+    }
+
+    /// Turn the document into the other form, caret and all. The half of
+    /// [`Self::set_mode`] that [`Self::with_mode`] needs without a window.
+    fn switch(&mut self, mode: Mode) {
+        match mode {
+            Mode::Source => {
+                let (source, offset) =
+                    markdown::serialize_at(&self.doc, self.cursor(), &self.marks);
+                self.doc = source_doc(&source);
+                self.selection = Selection::at(Cursor::new(0, Part::Code, offset));
+            }
+            Mode::Blocks => {
+                let (doc, at) =
+                    markdown::parse_at(self.source_text(), self.cursor().offset, &self.marks);
+                self.doc = doc;
+                ensure_block(&mut self.doc);
+                self.selection = Selection::at(at.clamp(&self.doc));
+                for anchor in &mut self.anchors {
+                    anchor.range = anchor.range.clamp(&self.doc);
+                }
+            }
+        }
+        self.mode = mode;
+    }
+
+    /// [`Mode::Source`] if the document is in blocks, and back again — what a
+    /// toggle in the app's own chrome calls.
+    pub fn toggle_source(&mut self, cx: &mut Context<Self>) {
+        self.set_mode(
+            match self.mode {
+                Mode::Blocks => Mode::Source,
+                Mode::Source => Mode::Blocks,
+            },
+            cx,
+        );
+    }
+
+    /// Whether the document is the thing being edited, rather than its source.
+    ///
+    /// Every operation that acts on *blocks* asks this: in source mode there is
+    /// one block, it is a fence holding a string, and turning it into a heading
+    /// or dragging it somewhere would edit the markup rather than the document
+    /// the markup spells.
+    fn blocks(&self) -> bool {
+        self.mode == Mode::Blocks
+    }
+
+    /// The text of the fence the source is held in — what is being edited in
+    /// [`Mode::Source`]. Only meaningful there; in [`Mode::Blocks`] the
+    /// document is the truth and this is whatever block zero happens to be.
+    fn source_text(&self) -> &str {
+        self.doc
+            .blocks
+            .first()
+            .and_then(|block| block.text_at(Part::Code))
+            .map_or("", |text| text.text.as_str())
+    }
+
+    /// Put the source back in the one fence it is edited as.
+    ///
+    /// Backspace at the start of an empty fence is a merge, and a merge with
+    /// nothing above it leaves a paragraph — a block the source view does not
+    /// paint and the caret would be stranded in. The text survives either way,
+    /// so this is a change of container and never of content.
+    fn ensure_source(&mut self) {
+        if self.doc.blocks.len() == 1 && matches!(self.doc.blocks[0].kind, BlockKind::Code { .. }) {
+            return;
+        }
+        let source = self
+            .doc
+            .blocks
+            .iter()
+            .filter_map(|block| block.text_at(*block.parts().first()?))
+            .map(|text| text.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let offset = self.selection.head.offset.min(source.len());
+        self.doc = source_doc(&source);
+        self.selection = Selection::at(Cursor::new(0, Part::Code, offset));
+    }
+
+    /// Shut everything floating. A switch of mode is a new document as far as
+    /// a menu anchored to a block is concerned.
+    fn dismiss_menus(&mut self) {
+        self.slash = None;
+        self.pasted = None;
+        self.url_prompt = None;
+        self.hovered = None;
+        self.lifted = None;
+        self.dropping = None;
     }
 
     /// Replace whatever is selected with `text`, applying a markdown prefix if
@@ -684,6 +1011,9 @@ impl Editor {
     /// second field and no focus to hand over — typing filters because typing
     /// is what it already was.
     fn track_slash(&mut self, typed: &str, painter: Painter) {
+        if !self.chrome.slash {
+            return;
+        }
         let at = self.cursor();
         let text = self
             .doc
@@ -797,6 +1127,11 @@ impl Editor {
     /// already carries it. Public because a toolbar reaches the same operation
     /// the key does.
     pub fn toggle_mark(&mut self, mark: Mark, cx: &mut Context<Self>) {
+        // Nothing in the source is a mark: the markup is already spelled out,
+        // and cmd-B over `**bold**` would fence what it reads.
+        if !self.blocks() {
+            return;
+        }
         // A caret inside a fence is enough to leave one, so this is the mark
         // that does not wait for a range: nothing typed into code is markup,
         // which leaves a stored mark there nothing to mean.
@@ -1002,6 +1337,11 @@ impl Editor {
     }
 
     fn indent(&mut self, _: &Indent, _: &mut Window, cx: &mut Context<Self>) {
+        // In the source there is one block to indent and indenting it would be
+        // invisible, so tab is what it is in any text editor: two spaces.
+        if !self.blocks() {
+            return self.insert(INDENT, cx);
+        }
         self.edit(EditKind::Structure, cx, |this| {
             this.doc.indent(this.cursor().block);
             vec![]
@@ -1009,6 +1349,9 @@ impl Editor {
     }
 
     fn outdent(&mut self, _: &Outdent, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.blocks() {
+            return self.unindent(cx);
+        }
         self.edit(EditKind::Structure, cx, |this| {
             this.doc.outdent(this.cursor().block);
             vec![]
@@ -1059,8 +1402,8 @@ impl Editor {
     fn selected_source(&self) -> Option<String> {
         (!self.selection.is_collapsed()).then(|| {
             let mut slice = self.doc.slice(self.selection);
-            slice.normalize();
-            markdown::serialize(&slice)
+            slice.normalize_with(&self.marks);
+            markdown::serialize_with(&slice, &self.marks)
         })
     }
 
@@ -1088,12 +1431,17 @@ impl Editor {
         let Some(item) = cx.read_from_clipboard() else {
             return;
         };
-        // A screenshot before its text, because a clipboard carrying both is
-        // carrying a file name for the picture — which is not the picture.
+        // A picture before its text, because a clipboard carrying both is
+        // carrying a name for the picture — which is not the picture. A
+        // screenshot has a file name beside its bytes, and a file copied in a
+        // file manager has its path beside the path itself.
         for entry in item.entries() {
-            if let gpui::ClipboardEntry::Image(image) = entry
-                && self.paste_image(image, cx)
-            {
+            let placed = match entry {
+                gpui::ClipboardEntry::Image(image) => self.paste_image(image, cx),
+                gpui::ClipboardEntry::ExternalPaths(paths) => self.paste_paths(paths, cx),
+                gpui::ClipboardEntry::String(_) => false,
+            };
+            if placed {
                 return;
             }
         }
@@ -1107,7 +1455,9 @@ impl Editor {
         self.edit(EditKind::Structure, cx, |this| {
             let removed = this.selection;
             let before = this.doc.blocks.len();
-            let head = this.doc.splice(removed, markdown::parse(&source));
+            let head = this
+                .doc
+                .splice(removed, markdown::parse_with(&source, &this.marks));
             this.selection = Selection::at(head.clamp(&this.doc));
             vec![Delta::Spliced(Splice {
                 removed,
@@ -1137,7 +1487,7 @@ impl Editor {
         });
         // A fence holds its URL literally and a caption cannot spell a mark, so
         // neither has a richer form to offer.
-        if !matches!(at.part, Part::Code | Part::Caption) {
+        if self.chrome.paste && !matches!(at.part, Part::Code | Part::Caption) {
             self.pasted = Some(link::Paste::open(at, url, alone));
             cx.notify();
         }
@@ -1234,13 +1584,19 @@ impl Editor {
     }
 
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(step) = self.history.undo(&self.doc, self.selection, &self.anchors) {
+        if let Some(step) = self
+            .history
+            .undo(self.mode, &self.doc, self.selection, &self.anchors)
+        {
             self.restore(step, cx);
         }
     }
 
     fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(step) = self.history.redo(&self.doc, self.selection, &self.anchors) {
+        if let Some(step) = self
+            .history
+            .redo(self.mode, &self.doc, self.selection, &self.anchors)
+        {
             self.restore(step, cx);
         }
     }
@@ -1254,6 +1610,11 @@ impl Editor {
         self.doc = step.doc;
         self.selection = step.selection.clamp(&self.doc);
         self.anchors = step.anchors;
+        if step.mode != self.mode {
+            self.mode = step.mode;
+            self.dismiss_menus();
+            cx.emit(EditorEvent::ModeChanged(step.mode));
+        }
         cx.emit(EditorEvent::Changed);
         cx.notify();
     }
@@ -1263,6 +1624,9 @@ impl Editor {
     /// Public because a gutter handle and a menu row reach the same operation
     /// as the key does — one vocabulary, not three paths into [`Doc`].
     pub fn move_block(&mut self, ix: usize, delta: isize, cx: &mut Context<Self>) {
+        if !self.blocks() {
+            return;
+        }
         self.edit(EditKind::Structure, cx, |this| {
             let caret = this.cursor();
             let at = this.doc.subtree(ix);
@@ -1278,6 +1642,9 @@ impl Editor {
     }
 
     pub fn duplicate_block(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if !self.blocks() {
+            return;
+        }
         self.edit(EditKind::Structure, cx, |this| {
             let span = this.doc.subtree(ix);
             let Some(copy) = this.doc.duplicate(ix) else {
@@ -1292,6 +1659,9 @@ impl Editor {
     }
 
     pub fn remove_block(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if !self.blocks() {
+            return;
+        }
         self.edit(EditKind::Structure, cx, |this| {
             let at = this.doc.subtree(ix);
             this.doc.remove_block(ix);
@@ -1303,6 +1673,9 @@ impl Editor {
 
     /// Tag a fenced block with the language it holds, or `None` for plain.
     pub fn set_language(&mut self, ix: usize, language: Option<String>, cx: &mut Context<Self>) {
+        if !self.blocks() {
+            return;
+        }
         self.edit(EditKind::Structure, cx, |this| {
             this.doc.set_language(ix, language);
             vec![]
@@ -1312,6 +1685,9 @@ impl Editor {
     /// Turn the caret's block into `kind` — what the slash menu and the block
     /// menu both do.
     pub fn set_block(&mut self, ix: usize, kind: BlockKind, cx: &mut Context<Self>) {
+        if !self.blocks() {
+            return;
+        }
         self.edit(EditKind::Structure, cx, |this| {
             this.doc.set_kind(ix, kind);
             this.selection = this.selection.clamp(&this.doc);
@@ -1326,6 +1702,9 @@ impl Editor {
         let Some(last) = self.doc.blocks.len().checked_sub(1) else {
             return false;
         };
+        if !self.blocks() {
+            return false;
+        }
         if self.doc.blocks[last].parts().last() == Some(&Part::Body) {
             return false;
         }
@@ -1351,6 +1730,28 @@ impl Editor {
             return false;
         };
         at.y > bounds.origin.y + bounds.size.height && self.append_tail(cx)
+    }
+
+    /// Shift-tab in the source: take back up to one [`INDENT`] of the spaces
+    /// before the caret, and nothing else — a line that is not indented has
+    /// nothing to give.
+    fn unindent(&mut self, cx: &mut Context<Self>) {
+        let at = self.cursor();
+        let Some(text) = self.caret_text() else {
+            return;
+        };
+        let before = &text.text[..at.offset];
+        let width = before.len() - before.trim_end_matches(' ').len();
+        let width = width.min(INDENT.len());
+        if width == 0 {
+            return;
+        }
+        self.edit(EditKind::Delete, cx, |this| {
+            let from = Cursor::new(at.block, at.part, at.offset - width);
+            let splice = this.doc.replace(Selection::new(from, at), Text::default());
+            this.selection = Selection::at(splice.caret.clamp(&this.doc));
+            vec![Delta::Spliced(splice)]
+        });
     }
 
     /// The caret's text, for the input handler's offset arithmetic.
@@ -1699,28 +2100,48 @@ impl Render for Editor {
                 div()
                     .w_full()
                     .pl(gpui::px(layout.text_inset))
-                    .child(markdown::render_with(
-                        &self.doc,
-                        markdown::Editing {
-                            selection,
-                            caret_on: self.caret_on,
-                            layouts: Some(&self.layouts),
-                            annotations: &self.annotations(),
-                            placeholder: focused.then(|| PLACEHOLDER.into()),
-                            // A caret goes into the caption here, so it is always
-                            // painted — an editor that could hide it would be
-                            // hiding a place you can already be typing.
-                            caption: markdown::Caption::Shown,
-                            // The size is absolute, so the factor the ladder
-                            // is already scaled by comes back out of it —
-                            // otherwise the app's size and this one multiply.
-                            typography: Some(markdown::Typography::of(cx).scaled(
-                                text_size::resolve(self.text_size, cx) / theme::base_text_size(),
-                            )),
-                        },
-                        window,
-                        cx,
-                    )),
+                    .child(match self.mode {
+                        // The source is one text, so it paints as one text —
+                        // the same caret, the same clicks, no block chrome to
+                        // suppress a piece at a time.
+                        Mode::Source => markdown::render_source(
+                            self.source_text(),
+                            markdown::Editing {
+                                selection,
+                                caret_on: self.caret_on,
+                                layouts: Some(&self.layouts),
+                                typography: Some(markdown::Typography::of(cx).scaled(
+                                    text_size::resolve(self.text_size, cx)
+                                        / theme::base_text_size(),
+                                )),
+                                ..Default::default()
+                            },
+                            cx,
+                        ),
+                        Mode::Blocks => markdown::render_with(
+                            &self.doc,
+                            markdown::Editing {
+                                selection,
+                                caret_on: self.caret_on,
+                                layouts: Some(&self.layouts),
+                                annotations: &self.annotations(),
+                                placeholder: focused.then(|| PLACEHOLDER.into()),
+                                // A caret goes into the caption here, so it is always
+                                // painted — an editor that could hide it would be
+                                // hiding a place you can already be typing.
+                                caption: markdown::Caption::Shown,
+                                // The size is absolute, so the factor the ladder
+                                // is already scaled by comes back out of it —
+                                // otherwise the app's size and this one multiply.
+                                typography: Some(markdown::Typography::of(cx).scaled(
+                                    text_size::resolve(self.text_size, cx)
+                                        / theme::base_text_size(),
+                                )),
+                            },
+                            window,
+                            cx,
+                        ),
+                    }),
             )
             // Last, so the layouts it reads are this frame's rather than the
             // one before — children paint in order.

@@ -67,7 +67,16 @@ pub fn init(cx: &mut App) {
     markdown::set_highlighter(cx, highlight::spans, highlight::languages());
     markdown::set_link_preview(cx, preview::of);
     markdown::set_block_renderer(cx, blocks::render);
-    editor::set_image_store(cx, store::of);
+    // The dialect this gallery reads and writes: two marks CommonMark has no
+    // spelling for, registered rather than waited on. See the Ribbon page.
+    markdown::set_marks(
+        cx,
+        markdown::Marks::new()
+            .with("highlight", "==")
+            .with("underline", "++"),
+    );
+    markdown::set_mark_paint(cx, patterns::ribbon::paint);
+    editor::set_image_store(cx, store::of());
     input::init(cx);
     editor::init(cx);
     palette::init(cx);
@@ -412,10 +421,13 @@ fn demo_menus() -> Vec<Menu> {
                 Item::action("New Window")
                     .with_icon(icons::glyph::FilePlus)
                     .with_keystroke("⌘N"),
+                // The described row, and the one that shows what a
+                // description too long for its line does: it clips, and the
+                // tooltip carries the whole of it.
                 Item::action("Open…")
                     .with_icon(icons::glyph::FolderOpen)
                     .with_keystroke("⌘O")
-                    .with_description("Choose a markdown file to edit"),
+                    .with_long_description("Choose a markdown file from this workspace to edit"),
                 Item::submenu(
                     "Open Recent",
                     vec![
@@ -614,6 +626,12 @@ pub const PATTERNS: &[Group] = &[
                 "apps/gallery/src/patterns/selectable.rs",
             ),
             section("editor", "Editor", "apps/gallery/src/patterns/editor.rs"),
+            section("ribbon", "Ribbon", "apps/gallery/src/patterns/ribbon.rs"),
+            section(
+                "markdown",
+                "Markdown",
+                "apps/gallery/src/patterns/dialect.rs",
+            ),
             section("syntax", "Syntax", "apps/gallery/src/patterns/syntax.rs"),
         ],
     },
@@ -919,6 +937,8 @@ pub struct Gallery {
     transcript: Entity<patterns::transcript::Transcript>,
     diff: Entity<patterns::diff::Diff>,
     document: Entity<patterns::document::Document>,
+    dialect: Entity<patterns::dialect::Dialect>,
+    ribbon: Entity<patterns::ribbon::RibbonDemo>,
     /// Prose a reader can drag over, which owns the selection the way any host
     /// of `markdown::selectable` has to.
     selectable: Entity<patterns::selectable::Selectable>,
@@ -1102,6 +1122,8 @@ impl Gallery {
             transcript: cx.new(patterns::transcript::Transcript::new),
             diff: cx.new(|_| patterns::diff::Diff),
             document: cx.new(patterns::document::Document::new),
+            dialect: cx.new(patterns::dialect::Dialect::new),
+            ribbon: cx.new(patterns::ribbon::RibbonDemo::new),
             selectable: cx.new(patterns::selectable::Selectable::new),
             editor: cx.new(patterns::editor::EditorDemo::new),
             #[cfg(not(target_family = "wasm"))]
@@ -4336,9 +4358,11 @@ impl Gallery {
                 .child(self.selectable.clone())
                 .into_any_element(),
             "editor" => self.editor.clone().into_any_element(),
+            "ribbon" => self.ribbon.clone().into_any_element(),
             #[cfg(not(target_family = "wasm"))]
             "agent-terminal" => self.terminal.clone().into_any_element(),
             "agent-orbs" => self.orbs.clone().into_any_element(),
+            "markdown" => self.dialect.clone().into_any_element(),
             "syntax" => self.syntax.clone().into_any_element(),
             "agent-avatar" => self.avatar.clone().into_any_element(),
 

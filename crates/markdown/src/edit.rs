@@ -735,6 +735,43 @@ impl Doc {
         }
     }
 
+    /// The marks a selection carries throughout — what a toolbar paints as lit.
+    ///
+    /// Collapsed, it answers with the marks the next character typed here would
+    /// join, which is the **left-sticky** rule [`Text::insert`] already
+    /// follows: the run ending at the caret, never the one starting there.
+    pub fn marks(&self, selection: Selection) -> Vec<Mark> {
+        let mut marks: Vec<Mark> = Vec::new();
+        if selection.is_collapsed() {
+            let at = selection.head.clamp(self);
+            let Some(text) = self.blocks.get(at.block).and_then(|b| b.text_at(at.part)) else {
+                return marks;
+            };
+            for span in &text.marks {
+                if span.range.start < at.offset && at.offset <= span.range.end {
+                    marks.push(span.mark.clone());
+                }
+            }
+            marks.dedup();
+            return marks;
+        }
+        for (at, range) in self.spans(selection) {
+            let Some(text) = self.blocks[at.block].text_at(at.part) else {
+                continue;
+            };
+            for span in &text.marks {
+                if span.range.start < range.end
+                    && span.range.end > range.start
+                    && !marks.contains(&span.mark)
+                {
+                    marks.push(span.mark.clone());
+                }
+            }
+        }
+        marks.retain(|mark| self.covered_by(selection, mark));
+        marks
+    }
+
     /// Whether every part of a selection already carries `mark` — what decides
     /// between adding it and taking it away, and what a toolbar button reads to
     /// know whether it is lit.
@@ -963,6 +1000,11 @@ impl Doc {
     /// output is one line, and renumbers ordered runs. After this,
     /// `parse(serialize(doc)) == doc`.
     pub fn normalize(&mut self) {
+        self.normalize_with(&crate::Marks::default());
+    }
+
+    /// [`Doc::normalize`] with the app's own marks — see [`crate::Marks`].
+    pub fn normalize_with(&mut self, marks: &crate::Marks) {
         for block in &mut self.blocks {
             let one_line = matches!(block.kind, BlockKind::Heading { .. });
             match &mut block.kind {
@@ -1021,7 +1063,7 @@ impl Doc {
         //
         // The cheaper rules above still earn their place: they are what keeps
         // the ordinary edit lossless, so this step has nothing left to take.
-        *self = crate::parse(&crate::serialize(self));
+        *self = crate::parse_with(&crate::serialize_with(self, marks), marks);
     }
 
     /// Tab. A block can go one level deeper than the one above it, and its

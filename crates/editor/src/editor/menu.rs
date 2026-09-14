@@ -33,6 +33,12 @@ impl Editor {
     /// The block the handle belongs on: the one being dragged, else the one
     /// under the pointer, else the one the caret is in.
     pub(super) fn handle_block(&self, focused: bool) -> Option<usize> {
+        if !self.chrome().handle {
+            return None;
+        }
+        if !self.blocks() {
+            return None;
+        }
         self.lifted
             .map(|(from, _)| from)
             .or(self.hovered)
@@ -124,6 +130,9 @@ impl Editor {
     /// The line showing where a lifted block — or a file dragged in from
     /// outside — would land.
     pub(super) fn drop_indicator(&self, theme: &Theme) -> Option<AnyElement> {
+        if !self.blocks() {
+            return None;
+        }
         let (from, to) = match self.lifted.filter(|(from, to)| from != to) {
             Some(lifted) => lifted,
             // A file always lands under the block it is over, so it is a drag
@@ -161,6 +170,10 @@ impl Editor {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        // The source is a fence too, and it has no language to pick.
+        if !self.chrome().language || !self.blocks() {
+            return None;
+        }
         // Whichever fence the reader is at: the one under the pointer, else the
         // one the caret is in.
         let ix = [self.hovered, Some(self.cursor().block)]
@@ -207,6 +220,9 @@ impl Editor {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        if !self.chrome().language || !self.blocks() {
+            return None;
+        }
         let view = Painter::of(cx);
         let &(ix, at) = self.language_menu.get()?;
         let Some(BlockKind::Code { language, .. }) = self.doc.blocks.get(ix).map(|b| &b.kind)
@@ -267,6 +283,9 @@ impl Editor {
 
     /// Turn into / Duplicate / Delete, at the handle that opened it.
     pub(super) fn block_menu(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.blocks() {
+            return None;
+        }
         let view = Painter::of(cx);
         let &(ix, at) = self.block_menu.get()?;
         let turns = crate::slash::items();

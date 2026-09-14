@@ -12,8 +12,13 @@
 //! all real. Column *values* here are therefore arbitrary; their relationships
 //! are not, and the relationships are what broke.
 
-use editor::Editor;
-use gpui::{Entity, Focusable, TestAppContext, VisualTestContext, WindowHandle, px, size};
+use std::sync::Mutex;
+
+use editor::{Editor, ImageStore, Source};
+use gpui::{
+    App, ClipboardEntry, ClipboardItem, ClipboardString, Entity, EntityId, ExternalPaths,
+    Focusable, TestAppContext, VisualTestContext, WindowHandle, px, size,
+};
 
 const SOURCE: &str = "# Title\n\nA paragraph long enough that it has to wrap more than once inside the pane it is painted into, which is what makes it worth testing.\n\n- first\n- second\n\n> a quote";
 
@@ -425,5 +430,424 @@ fn a_second_press_on_the_handle_leaves_the_block_menu_shut(cx: &mut TestAppConte
     assert!(
         cx.debug_bounds(editor::BLOCK_MENU).is_none(),
         "the second press leaves it shut instead of closing and reopening"
+    );
+}
+
+/// Copying a file in a file manager rather than dragging it. macOS puts the
+/// path on the clipboard as text beside the file itself, and the text is not
+/// the picture — which is the whole of the bug this answers.
+#[gpui::test]
+fn a_copied_image_file_pastes_as_the_picture(cx: &mut TestAppContext) {
+    let (editor, _window, mut cx) = open_with("", cx);
+    // A space in the path, because a project directory has one and the
+    // destination has to come back through the serializer intact.
+    let path = std::path::PathBuf::from("/My Notes/shot.png");
+    cx.update(|_, cx| {
+        cx.write_to_clipboard(ClipboardItem {
+            entries: vec![
+                ClipboardEntry::ExternalPaths(ExternalPaths(vec![path.clone()].into())),
+                ClipboardEntry::String(ClipboardString::new(path.display().to_string())),
+            ],
+        })
+    });
+    cx.simulate_keystrokes(&format!("{PRIMARY}-v"));
+    assert_eq!(source(&editor, &mut cx), "![](</My Notes/shot.png>)");
+}
+
+/// And a file that is not a picture still pastes as its path, which is what
+/// the text beside it was for.
+#[gpui::test]
+fn a_copied_file_that_is_not_a_picture_pastes_its_path(cx: &mut TestAppContext) {
+    let (editor, _window, mut cx) = open_with("", cx);
+    let path = std::path::PathBuf::from("/tmp/notes.txt");
+    cx.update(|_, cx| {
+        cx.write_to_clipboard(ClipboardItem {
+            entries: vec![
+                ClipboardEntry::ExternalPaths(ExternalPaths(vec![path.clone()].into())),
+                ClipboardEntry::String(ClipboardString::new(path.display().to_string())),
+            ],
+        })
+    });
+    cx.simulate_keystrokes(&format!("{PRIMARY}-v"));
+    assert_eq!(source(&editor, &mut cx), "/tmp/notes.txt");
+}
+
+/// Which editor the store was last asked on behalf of. A `fn` carries nothing,
+/// which is the whole point — everything it needs comes in as an argument, and
+/// a test is the one place with nowhere else to put the answer.
+static ASKED: Mutex<Option<EntityId>> = Mutex::new(None);
+
+fn keep(source: Source, editor: &Entity<Editor>, _: &App) -> Option<String> {
+    *ASKED.lock().unwrap() = Some(editor.entity_id());
+    match source {
+        Source::File(path) => Some(format!("media://{}", path.file_name()?.to_str()?)),
+        Source::Bytes(_) => None,
+    }
+}
+
+/// Put `path` on the clipboard the way a file manager does — the file itself,
+/// and its path as text beside it.
+fn copy_file(path: &str, cx: &mut VisualTestContext) {
+    let path = std::path::PathBuf::from(path);
+    cx.update(|_, cx| {
+        cx.write_to_clipboard(ClipboardItem {
+            entries: vec![
+                ClipboardEntry::ExternalPaths(ExternalPaths(vec![path.clone()].into())),
+                ClipboardEntry::String(ClipboardString::new(path.display().to_string())),
+            ],
+        })
+    });
+}
+
+/// The store is told which document is asking, so an app holding two of them
+/// answers for the right one. The bare `fn` it replaced could only be told by
+/// a global the app had to keep in step by hand.
+#[gpui::test]
+fn the_store_is_told_which_editor_is_asking(cx: &mut TestAppContext) {
+    let (editor, _window, mut cx) = open_with("", cx);
+    cx.update(|_, cx| {
+        editor::set_image_store(
+            cx,
+            ImageStore {
+                keep,
+                ..ImageStore::default()
+            },
+        )
+    });
+    copy_file("/My Notes/shot.png", &mut cx);
+    cx.simulate_keystrokes(&format!("{PRIMARY}-v"));
+
+    assert_eq!(source(&editor, &mut cx), "![](media://shot.png)");
+    assert_eq!(
+        *ASKED.lock().unwrap(),
+        Some(editor.entity_id()),
+        "the store was asked on behalf of the editor that pasted"
+    );
+}
+
+/// What counts as a picture is the app's to widen. The default guesses from
+/// the extension, and an app with its own decoder says so.
+#[gpui::test]
+fn a_store_decides_for_itself_what_a_picture_is(cx: &mut TestAppContext) {
+    let (editor, _window, mut cx) = open_with("", cx);
+    cx.update(|_, cx| {
+        editor::set_image_store(
+            cx,
+            ImageStore {
+                keep,
+                accepts: |path| path.extension().is_some_and(|ext| ext == "heic"),
+            },
+        )
+    });
+    copy_file("/My Notes/shot.heic", &mut cx);
+    cx.simulate_keystrokes(&format!("{PRIMARY}-v"));
+    assert_eq!(source(&editor, &mut cx), "![](media://shot.heic)");
+}
+
+/// And it narrows as well as widens: a `.png` the store does not claim stays
+/// the path it was, even though the default guess would have taken it.
+#[gpui::test]
+fn a_file_the_store_refuses_pastes_as_its_path(cx: &mut TestAppContext) {
+    let (editor, _window, mut cx) = open_with("", cx);
+    cx.update(|_, cx| {
+        editor::set_image_store(
+            cx,
+            ImageStore {
+                keep,
+                accepts: |path| path.extension().is_some_and(|ext| ext == "heic"),
+            },
+        )
+    });
+    copy_file("/My Notes/shot.png", &mut cx);
+    cx.simulate_keystrokes(&format!("{PRIMARY}-v"));
+    assert_eq!(source(&editor, &mut cx), "/My Notes/shot.png");
+}
+
+/// The caret's trip into the source and back, driven the way the app's own
+/// toggle drives it.
+#[gpui::test]
+fn the_source_keeps_the_caret_and_gives_it_back(cx: &mut TestAppContext) {
+    let (editor, _window, mut cx) = open(cx);
+    go_to_block(&editor, &mut cx, 2);
+    cx.simulate_keystrokes("right right right");
+    let before = head(&editor, &mut cx);
+    let document = source(&editor, &mut cx);
+
+    cx.update(|_, cx| editor.update(cx, |editor, cx| editor.toggle_source(cx)));
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| editor.read(cx).mode()),
+        editor::Mode::Source
+    );
+    assert_eq!(
+        source(&editor, &mut cx),
+        document,
+        "the source view holds exactly what a save would write"
+    );
+    let at = head(&editor, &mut cx);
+    assert_eq!(at.part, markdown::Part::Code, "one text, the fence's");
+    assert!(at.offset > 0, "and the caret came with it");
+
+    cx.update(|_, cx| editor.update(cx, |editor, cx| editor.toggle_source(cx)));
+    cx.run_until_parked();
+    assert_eq!(head(&editor, &mut cx), before, "and goes back where it was");
+    assert_eq!(source(&editor, &mut cx), document, "with nothing moved");
+}
+
+#[gpui::test]
+fn typing_in_the_source_is_typing_in_the_document(cx: &mut TestAppContext) {
+    let (editor, _window, mut cx) = open_with("# Title\n\nbody", cx);
+    cx.update(|_, cx| editor.update(cx, |editor, cx| editor.toggle_source(cx)));
+    cx.run_until_parked();
+    // The caret lands where the *text* starts, past the heading's marker, so
+    // this walks back onto the markup itself before typing into it.
+    cx.simulate_keystrokes("home");
+    cx.simulate_input("#");
+    cx.update(|_, cx| editor.update(cx, |editor, cx| editor.toggle_source(cx)));
+    cx.run_until_parked();
+
+    assert_eq!(
+        cx.update(|_, cx| editor.read(cx).doc().blocks[0].kind.clone()),
+        markdown::BlockKind::Heading {
+            level: 2,
+            text: markdown::Text::plain("Title"),
+        },
+        "a `#` typed into the markup is a heading level when the document comes back"
+    );
+}
+
+#[gpui::test]
+fn enter_in_the_source_is_a_newline_and_undo_crosses_the_switch(cx: &mut TestAppContext) {
+    let (editor, _window, mut cx) = open_with("# Title", cx);
+    cx.update(|_, cx| editor.update(cx, |editor, cx| editor.toggle_source(cx)));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("end enter");
+    cx.simulate_input("body");
+    assert_eq!(
+        source(&editor, &mut cx),
+        "# Title\nbody",
+        "enter is a newline in the markup rather than a split"
+    );
+
+    cx.simulate_keystrokes(&format!("{PRIMARY}-z {PRIMARY}-z {PRIMARY}-z"));
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| editor.read(cx).mode()),
+        editor::Mode::Blocks,
+        "stepping back over the switch comes back to the document"
+    );
+    assert_eq!(source(&editor, &mut cx), "# Title");
+}
+
+#[gpui::test]
+fn the_block_chrome_stays_out_of_the_source(cx: &mut TestAppContext) {
+    let (editor, _window, mut cx) = open(cx);
+    cx.update(|_, cx| editor.update(cx, |editor, cx| editor.toggle_source(cx)));
+    cx.run_until_parked();
+
+    // The gutter handle is the block chrome that follows the caret, so it is
+    // the one that would show up on a fence holding a whole document.
+    assert!(
+        !cx.debug_bounds(editor::BLOCK_HANDLE).is_some(),
+        "no handle: there are no blocks to drag"
+    );
+    // Turning "the block" into a heading would wrap the markup in one.
+    cx.update(|_, cx| {
+        editor.update(cx, |editor, cx| {
+            editor.set_block(
+                0,
+                markdown::BlockKind::Heading {
+                    level: 1,
+                    text: markdown::Text::default(),
+                },
+                cx,
+            );
+        });
+    });
+    assert_eq!(
+        cx.update(|_, cx| editor.read(cx).mode()),
+        editor::Mode::Source
+    );
+    assert!(
+        source(&editor, &mut cx).starts_with("# Title"),
+        "and the source is untouched"
+    );
+}
+
+/// Emptying the source is the one edit that can take the fence holding it
+/// away, which would leave the caret in a block the source view never paints.
+#[gpui::test]
+fn the_source_survives_being_emptied(cx: &mut TestAppContext) {
+    let (editor, _window, mut cx) = open_with("# Title\n\nbody", cx);
+    cx.update(|_, cx| editor.update(cx, |editor, cx| editor.toggle_source(cx)));
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes(&format!("{PRIMARY}-a backspace backspace backspace"));
+    cx.run_until_parked();
+    assert_eq!(source(&editor, &mut cx), "", "the source is empty");
+    assert_eq!(
+        head(&editor, &mut cx).part,
+        markdown::Part::Code,
+        "and the caret is still in the text the source view paints"
+    );
+
+    cx.simulate_input("hi");
+    cx.update(|_, cx| editor.update(cx, |editor, cx| editor.toggle_source(cx)));
+    cx.run_until_parked();
+    assert_eq!(
+        source(&editor, &mut cx),
+        "hi",
+        "and typing carries back out"
+    );
+}
+
+/// The one read a toolbar takes per frame, over the states it has to tell
+/// apart.
+#[gpui::test]
+fn formatting_answers_for_the_whole_bar(cx: &mut TestAppContext) {
+    let (editor, _window, mut cx) = open_with("# Title\n\n**bold** tail", cx);
+    let formatting = |cx: &mut VisualTestContext| cx.update(|_, cx| editor.read(cx).formatting());
+
+    let at_title = formatting(&mut cx);
+    assert_eq!(at_title.block.as_deref(), Some("Heading 1"));
+    assert!(at_title.marks.is_empty(), "nothing marked at the start");
+    assert!(!at_title.fenceable, "and one line is not a fence");
+
+    // Into the paragraph, and through the bold run: the caret picks the mark up
+    // at the end of the run, which is where a typed character would join it.
+    go_to_block(&editor, &mut cx, 1);
+    cx.simulate_keystrokes("right right right right");
+    let in_bold = formatting(&mut cx);
+    assert_eq!(in_bold.block.as_deref(), Some("Text"));
+    assert_eq!(in_bold.marks, vec![markdown::Mark::Bold]);
+
+    // cmd-B at a collapsed caret outside the run is a stored mark, and the
+    // button that took it has to stay lit until something spends it.
+    cx.simulate_keystrokes(&format!("end {PRIMARY}-b"));
+    assert_eq!(formatting(&mut cx).marks, vec![markdown::Mark::Bold]);
+
+    // And in the source there is nothing to light.
+    cx.update(|_, cx| editor.update(cx, |editor, cx| editor.toggle_source(cx)));
+    cx.run_until_parked();
+    let in_source = formatting(&mut cx);
+    assert_eq!(in_source.mode, editor::Mode::Source);
+    assert!(in_source.marks.is_empty() && !in_source.fenceable);
+}
+
+#[gpui::test]
+fn a_selection_over_two_blocks_reads_as_fenceable(cx: &mut TestAppContext) {
+    let (editor, _window, mut cx) = open_with("one\n\ntwo", cx);
+    cx.simulate_keystrokes("shift-down shift-end");
+    let formatting = cx.update(|_, cx| editor.read(cx).formatting());
+    assert!(
+        formatting.fenceable,
+        "cmd-E over two blocks makes a fence, which only the editor can say"
+    );
+}
+
+/// An editor built with something turned off — the app's own chrome in the same
+/// place, or a document meant to carry none.
+fn open_built(
+    source: &str,
+    build: impl FnOnce(Editor) -> Editor,
+    cx: &mut TestAppContext,
+) -> (Entity<Editor>, VisualTestContext) {
+    cx.update(|cx| {
+        theme::Theme::install(theme::Appearance::Dark, cx);
+        editor::init(cx);
+    });
+    let window = cx.add_window(|_, cx| build(Editor::new(source, cx)));
+    let editor = window.root(cx).unwrap();
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_resize(size(px(360.0), px(600.0)));
+    visual.update(|window, cx| {
+        let handle = editor.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+    });
+    visual.run_until_parked();
+    (editor, visual)
+}
+
+#[gpui::test]
+fn chrome_turned_off_never_reaches_the_screen(cx: &mut TestAppContext) {
+    let plain = editor::Chrome {
+        handle: false,
+        slash: false,
+        ..Default::default()
+    };
+    let (editor, mut cx) = open_built("# Title", move |editor| editor.with_chrome(plain), cx);
+
+    assert!(
+        cx.debug_bounds(editor::BLOCK_HANDLE).is_none(),
+        "no gutter handle on a document that asked for none"
+    );
+    cx.simulate_keystrokes("end enter");
+    cx.simulate_input("/");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds(editor::SLASH_MENU).is_none(),
+        "and the slash is a slash"
+    );
+    assert_eq!(
+        source(&editor, &mut cx),
+        "# Title\n\n/",
+        "which is typed into the document like any other character"
+    );
+}
+
+#[gpui::test]
+fn an_editor_can_open_on_its_source(cx: &mut TestAppContext) {
+    let (editor, mut cx) = open_built(
+        "# Title\n\nbody",
+        |editor| editor.with_mode(editor::Mode::Source),
+        cx,
+    );
+
+    assert_eq!(
+        cx.update(|_, cx| editor.read(cx).mode()),
+        editor::Mode::Source
+    );
+    assert_eq!(source(&editor, &mut cx), "# Title\n\nbody");
+    assert_eq!(
+        head(&editor, &mut cx).part,
+        markdown::Part::Code,
+        "the caret is in the text the source view paints"
+    );
+}
+
+#[gpui::test]
+fn an_app_mark_survives_the_editor(cx: &mut TestAppContext) {
+    let marks = markdown::Marks::new().with("highlight", "==");
+    let (editor, mut cx) = open_built("a ==lit== word", move |editor| editor.with_marks(marks), cx);
+
+    let highlight = markdown::Mark::Custom("highlight".into());
+    cx.simulate_keystrokes("right right right");
+    assert_eq!(
+        cx.update(|_, cx| editor.read(cx).formatting().marks),
+        vec![highlight.clone()],
+        "a mark the library has never heard of lights a button like any other"
+    );
+    assert_eq!(
+        source(&editor, &mut cx),
+        "a ==lit== word",
+        "and is written back with the delimiter that spells it"
+    );
+
+    cx.update(|_, cx| {
+        editor.update(cx, |editor, cx| {
+            editor.select(
+                markdown::Selection::new(
+                    markdown::Cursor::new(0, markdown::Part::Body, 2),
+                    markdown::Cursor::new(0, markdown::Part::Body, 5),
+                ),
+                cx,
+            );
+            editor.toggle_mark(highlight, cx);
+        })
+    });
+    assert_eq!(
+        source(&editor, &mut cx),
+        "a lit word",
+        "and the same toggle takes it off again"
     );
 }
