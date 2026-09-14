@@ -3,8 +3,6 @@ title: Layout
 description: Spacing steps, corner radii and chrome heights as plain numbers on Theme — no layout constant ever depends on which color is painted.
 ---
 
-Law 4: numbers drive layout, colors are paint. Spacing and chrome heights are `f32` associated consts on `Theme` and the radii are `f32` functions, so a layout number resolves without reading the theme global at all:
-
 ```rust
 div()
     .gap(px(Theme::SPACE))
@@ -12,16 +10,54 @@ div()
     .h(px(Theme::HEADER_HEIGHT))
 ```
 
-Spacing is one number, not a ladder: `SPACE` 8, measured on macOS 26 where `NSStackView().spacing`, visual format's `-` and `constraint(equalToSystemSpacingAfter:)` all report it, with `CONTENT_MARGIN` 20 the same measurement from content to its container's edge. `ui::stack::row` and `ui::stack::column` carry it, so a call site that wants the standard gap writes no number at all — SwiftUI's shape, where `VStack(spacing:)` takes the system's when given nothing.
+Spacing and chrome heights are `f32` consts and the radii are `f32` functions, so a layout number resolves without reading the theme global at all.
 
-Radii are functions rather than consts, because every one of them is a ratio of `BASE_RADIUS` 8 and `Brand::radius` moves the whole set together. They run `control_radius()` 0.75x for things that sit inside a control, `button_radius()` 1x for controls themselves, `panel_radius()` 1.25x for cards, `surface_radius()` 1.5x for floating surfaces, `bubble_radius()` 2x for message bubbles. Chrome heights — `TITLEBAR_HEIGHT`, `HEADER_HEIGHT`, `STATUS_STRIP_HEIGHT` — are named for the same reason: a status strip that is reserved rather than conditional keeps the composer from shifting when it fills.
-
-`surface_radius()` is read at both ends of a glass surface: the border paints it, and `ui::surface` cuts the backdrop blur to it. A blur cut to a different radius frosts square corners outside a round border, visible only on glass and only at the corners — which is why the number is named once instead of written twice.
-
-Nested corners come out of arithmetic rather than a second constant:
+## Nested corners
 
 ```rust
 Theme::inset_radius(Theme::surface_radius(), 4.0) // 8.0
 ```
 
-That is SwiftUI's `ContainerRelativeShape` rule. gpui has no container shape to inherit at paint time, so the relationship is stated where the child is defined — a container that changes its padding carries its rows with it, and the derived value never hardens into a constant of its own.
+SwiftUI's `ContainerRelativeShape` rule. gpui has no container shape to inherit at paint time, so the relationship is stated where the child is defined.
+
+## API
+
+```rust
+impl Theme {
+    /// One number, not a ladder. `ui::stack::row` and `column` carry it, so a
+    /// call site wanting the standard gap writes none.
+    pub const SPACE: f32 = 8.0;
+
+    /// Content to its container's edge.
+    pub const CONTENT_MARGIN: f32 = 20.0;
+
+    // Reserved rather than conditional, so a strip filling never shifts the
+    // composer.
+    pub const TITLEBAR_HEIGHT: f32 = 38.0;
+    pub const HEADER_HEIGHT: f32 = 44.0;
+    pub const STATUS_STRIP_HEIGHT: f32 = 24.0;
+
+    /// Every radius below is a ratio of this, so `Brand::radius` moves the
+    /// whole set together and keeps the concentric relationships intact.
+    pub const BASE_RADIUS: f32 = 8.0;
+
+    /// 0.75x — things that sit inside a control.
+    pub fn control_radius() -> f32;
+    /// 1x — controls themselves.
+    pub fn button_radius() -> f32;
+    /// 1.25x — cards.
+    pub fn panel_radius() -> f32;
+    /// 1.5x — floating surfaces. Read at both ends of glass: the border paints
+    /// it and `ui::surface` cuts the blur to it.
+    pub fn surface_radius() -> f32;
+    /// 2x — message bubbles.
+    pub fn bubble_radius() -> f32;
+
+    /// SwiftUI's `ContainerRelativeShape` rule, stated where the child is.
+    pub const fn inset_radius(outer: f32, inset: f32) -> f32;
+
+    // ...
+}
+```
+
+Every radius is a ratio of `BASE_RADIUS` 8, so `Brand::radius` moves the whole set together and keeps the concentric relationships intact.

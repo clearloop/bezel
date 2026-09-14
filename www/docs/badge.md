@@ -10,6 +10,18 @@ theme.badge("badge")
 theme.badge_active("active")
 ```
 
-The plain badge is a hairline pill in the muted text tone; `badge_active` is the emerald "connected / running / on" pill.
+Both return a `Div`, so a badge with an icon in it is a child you add.
 
-Both are plain `Div`s, so a badge with an icon in it is a child you add.
+## API
+
+```rust
+pub trait Content: ThemeExt {
+    /// Hairline pill in the muted text tone.
+    fn badge(&self, label: impl Into<SharedString>) -> Div;
+
+    /// The emerald "connected / running / on" pill.
+    fn badge_active(&self, label: impl Into<SharedString>) -> Div;
+
+    // ...
+}
+```

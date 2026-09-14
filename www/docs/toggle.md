@@ -11,8 +11,18 @@ theme.toggle(self.enabled)
 
 Display-only, like the rest of `widgets`: the caller adds `.id(..)` and `.on_click(..)`, and holds the bool.
 
-Tab focus and `space`/`enter` come from the same wrapper every stateless control uses:
+## Keyboard
 
 ```rust
 focus::focusable(&theme, &self.switch, theme.toggle(self.enabled))
+```
+
+## API
+
+```rust
+pub trait Controls: ThemeExt {
+    fn toggle(&self, on: bool) -> Div;
+
+    // ...
+}
 ```

@@ -3,8 +3,6 @@ title: Tree view
 description: Nested rows with disclosure, indent guides and arrow keys — driven by a depth-annotated flat list, not by a tree the library walks.
 ---
 
-bezel cannot walk your tree. It has no idea what a node is, and a trait or a callback to find out would be a data model this library does not want to own. So the app flattens what is currently visible — which it has to do to render it anyway:
-
 ```rust
 use ui::tree::{self, Row};
 
@@ -19,11 +17,9 @@ tree::tree().children(rows.iter().enumerate().map(|(index, (row, label))| {
 }))
 ```
 
-A depth-annotated flat list is a complete navigation model. Everything a tree does falls out of `Row { depth, expanded }` with no parent pointers and no traversal: down and up are neighbouring indices, a first child is simply the next row, and a parent is the nearest row above with a smaller depth.
+The app flattens what is currently visible — which it has to do to render it anyway. A depth-annotated flat list is a complete navigation model: down and up are neighbouring indices, a first child is the next row, and a parent is the nearest row above with a smaller depth.
 
-`expanded` is `None` for a leaf, which is a different thing from a closed branch — the difference is what stops `right` pretending a file can open.
-
-Keys report an intent rather than performing one, because applying it means touching the expansion set the app owns:
+## Keys
 
 ```rust
 match tree::step(&rows, self.cursor, tree::Direction::Right) {
@@ -34,8 +30,32 @@ match tree::step(&rows, self.cursor, tree::Direction::Right) {
 }
 ```
 
-Neither end wraps. A menu wraps because it is a ring of choices; a tree is a document, and arriving back at the top because you pressed down once too often loses your place in it.
+## API
 
-`tree_row` takes two flags: `selected` is what the app considers chosen, `cursor` is where the keyboard is. They are the same pair a menu row draws with, so a tree and a menu never look like two different products.
+```rust
+// ui::tree
 
-Scrolling is the caller's, through `scroll`. Expansion stays with the app because it *is* app data — a file tree's open folders often outlive the window.
+pub fn init(cx: &mut App);
+pub fn tree() -> gpui::Div;
+
+/// `selected` is what the app considers chosen, `cursor` is where the keyboard
+/// is — the same pair a menu row draws with.
+pub fn tree_row(theme: &Theme, row: &Row, selected: bool, cursor: bool) -> gpui::Div;
+
+/// `expanded: None` is a leaf, which is a different thing from a closed branch
+/// — the difference is what stops `right` pretending a file can open.
+pub struct Row {
+    pub depth: usize,
+    pub expanded: Option<bool>,
+}
+
+/// Reports an intent rather than performing one: applying it means touching
+/// the expansion set the app owns. Neither end wraps.
+pub fn step(rows: &[Row], cursor: usize, direction: Direction) -> Option<Move>;
+
+pub enum Move { To(usize), Expand(usize), Collapse(usize) }
+
+// ...
+```
+
+Scrolling is the caller's, through [`scroll`](/docs/scroll-area). Expansion stays with the app because it *is* app data: a file tree's open folders often outlive the window.

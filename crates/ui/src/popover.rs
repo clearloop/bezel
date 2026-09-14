@@ -72,6 +72,7 @@ pub struct Popup<T> {
     /// Whether the popup was still mounted when the current trigger press
     /// began — see [`Self::note_trigger_press`].
     pressed_while_open: bool,
+    generation: u64,
 }
 
 impl<T> Default for Popup<T> {
@@ -79,12 +80,14 @@ impl<T> Default for Popup<T> {
         Self {
             inner: None,
             pressed_while_open: false,
+            generation: 0,
         }
     }
 }
 
 impl<T> Popup<T> {
     pub fn open(&mut self, value: T) {
+        self.generation = self.generation.wrapping_add(1);
         self.inner = Some((value, None));
     }
 
@@ -150,6 +153,7 @@ impl<T> Popup<T> {
     pub fn begin_close(&mut self) -> bool {
         match &mut self.inner {
             Some((_, closing @ None)) => {
+                self.generation = self.generation.wrapping_add(1);
                 *closing = Some(web_time::Instant::now());
                 true
             }
@@ -208,9 +212,11 @@ impl<T> Popup<T> {
 /// span, drop the popup state and repaint. `popup` re-borrows the field from
 /// the view (the state can't be captured — the view owns it).
 pub fn reap_popup<V: 'static, T: 'static>(
+    view: &mut V,
     cx: &mut gpui::Context<V>,
     popup: impl Fn(&mut V) -> &mut Popup<T> + 'static,
 ) {
+    let generation = popup(view).generation;
     cx.spawn(async move |view, cx| {
         cx.background_executor()
             .timer(
@@ -221,8 +227,11 @@ pub fn reap_popup<V: 'static, T: 'static>(
             )
             .await;
         view.update(cx, |view, cx| {
-            popup(view).finish_close();
-            cx.notify();
+            let popup = popup(view);
+            if popup.generation == generation && popup.is_closing() {
+                popup.finish_close();
+                cx.notify();
+            }
         })
         .ok();
     })
@@ -238,7 +247,7 @@ pub fn close_popup<V: 'static, T: 'static>(
     popup: impl Fn(&mut V) -> &mut Popup<T> + Copy + 'static,
 ) {
     if popup(view).begin_close() {
-        reap_popup(cx, popup);
+        reap_popup(view, cx, popup);
         cx.notify();
     }
 }
@@ -591,6 +600,32 @@ fn menu_motion(id: SharedString, exit: Option<f32>, inner: gpui::Div) -> AnyElem
     }
 }
 
+/// The common floating layer. Trigger wrappers only choose the origin.
+fn menu_layer(
+    id: impl Into<SharedString>,
+    content: AnyElement,
+    closing: Option<web_time::Instant>,
+    anchor: Anchor,
+    position: Option<Point<Pixels>>,
+    gap: f32,
+) -> AnyElement {
+    let content = material_menu(content);
+    let inner = match anchor {
+        Anchor::BottomLeft | Anchor::BottomRight => div().occlude().pb(px(gap)),
+        _ => div().occlude().pt(px(gap)),
+    }
+    .child(content);
+    let mut layer = gpui::anchored()
+        .anchor(anchor)
+        .snap_to_window_with_margin(px(8.0));
+    if let Some(position) = position {
+        layer = layer.position(position);
+    }
+    gpui::deferred(layer.child(menu_motion(id.into(), closing.map(exit_progress), inner)))
+        .priority(1)
+        .into_any_element()
+}
+
 /// Wrap popover content in a floating anchored layer attached to the trigger:
 /// the caller `.child(anchored_menu(...))`s this from the trigger element while
 /// open. Plays `menu-in` (0.14s fade + 2px drop); `closing` (the [`Popup`]
@@ -603,22 +638,7 @@ pub fn anchored_menu(
     content: AnyElement,
     closing: Option<web_time::Instant>,
 ) -> AnyElement {
-    let exit = closing.map(exit_progress);
-    let content = material_menu(content);
-    pinned_layer(
-        gpui::deferred(
-            gpui::anchored()
-                .anchor(Anchor::TopLeft)
-                .snap_to_window_with_margin(px(8.0))
-                .child(menu_motion(
-                    id.into(),
-                    exit,
-                    div().occlude().pt(px(6.0)).child(content),
-                )),
-        )
-        .priority(1)
-        .into_any_element(),
-    )
+    pinned_layer(menu_layer(id, content, closing, Anchor::TopLeft, None, 6.0))
 }
 
 /// [`anchored_menu`] opening DOWNWARD from the trigger's bottom edge — a
@@ -642,27 +662,12 @@ pub fn anchored_menu_below_gap(
     closing: Option<web_time::Instant>,
     gap: f32,
 ) -> AnyElement {
-    let exit = closing.map(exit_progress);
-    let content = material_menu(content);
     div()
         .absolute()
         .bottom_0()
         .left_0()
         .size_0()
-        .child(
-            gpui::deferred(
-                gpui::anchored()
-                    .anchor(Anchor::TopLeft)
-                    .snap_to_window_with_margin(px(8.0))
-                    .child(menu_motion(
-                        id.into(),
-                        exit,
-                        div().occlude().pt(px(gap)).child(content),
-                    )),
-            )
-            .priority(1)
-            .into_any_element(),
-        )
+        .child(menu_layer(id, content, closing, Anchor::TopLeft, None, gap))
         .into_any_element()
 }
 
@@ -677,22 +682,12 @@ pub fn anchored_menu_below_gap(
 /// No `closing`: a submenu is held open by the cursor, and the cursor is
 /// cleared before the menu it hangs in begins its own exit.
 pub fn anchored_submenu(id: impl Into<SharedString>, content: AnyElement) -> AnyElement {
-    let content = material_menu(content);
     div()
         .absolute()
         .top(px(-MENU_PAD))
         .right(px(-MENU_PAD))
         .size_0()
-        .child(
-            gpui::deferred(
-                gpui::anchored()
-                    .anchor(Anchor::TopLeft)
-                    .snap_to_window_with_margin(px(8.0))
-                    .child(menu_motion(id.into(), None, div().occlude().child(content))),
-            )
-            .priority(1)
-            .into_any_element(),
-        )
+        .child(menu_layer(id, content, None, Anchor::TopLeft, None, 0.0))
         .into_any_element()
 }
 
@@ -704,22 +699,14 @@ pub fn anchored_menu_above(
     content: AnyElement,
     closing: Option<web_time::Instant>,
 ) -> AnyElement {
-    let exit = closing.map(exit_progress);
-    let content = material_menu(content);
-    pinned_layer(
-        gpui::deferred(
-            gpui::anchored()
-                .anchor(Anchor::BottomLeft)
-                .snap_to_window_with_margin(px(8.0))
-                .child(menu_motion(
-                    id.into(),
-                    exit,
-                    div().occlude().pb(px(6.0)).child(content),
-                )),
-        )
-        .priority(1)
-        .into_any_element(),
-    )
+    pinned_layer(menu_layer(
+        id,
+        content,
+        closing,
+        Anchor::BottomLeft,
+        None,
+        6.0,
+    ))
 }
 
 /// Open an upward menu at a point inside a relative trigger. Useful for text
@@ -748,27 +735,19 @@ pub fn anchored_menu_above_end(
     content: AnyElement,
     closing: Option<web_time::Instant>,
 ) -> AnyElement {
-    let exit = closing.map(exit_progress);
-    let content = material_menu(content);
     div()
         .absolute()
         .top_0()
         .right_0()
         .size_0()
-        .child(
-            gpui::deferred(
-                gpui::anchored()
-                    .anchor(Anchor::BottomRight)
-                    .snap_to_window_with_margin(px(8.0))
-                    .child(menu_motion(
-                        id.into(),
-                        exit,
-                        div().occlude().pb(px(6.0)).child(content),
-                    )),
-            )
-            .priority(1)
-            .into_any_element(),
-        )
+        .child(menu_layer(
+            id,
+            content,
+            closing,
+            Anchor::BottomRight,
+            None,
+            6.0,
+        ))
         .into_any_element()
 }
 
@@ -780,17 +759,7 @@ pub fn menu_at(
     content: AnyElement,
     closing: Option<web_time::Instant>,
 ) -> AnyElement {
-    let exit = closing.map(exit_progress);
-    let content = material_menu(content);
-    gpui::deferred(
-        gpui::anchored()
-            .position(position)
-            .anchor(Anchor::TopLeft)
-            .snap_to_window_with_margin(px(8.0))
-            .child(menu_motion(id.into(), exit, div().occlude().child(content))),
-    )
-    .priority(1)
-    .into_any_element()
+    menu_layer(id, content, closing, Anchor::TopLeft, Some(position), 0.0)
 }
 
 /// Modal/overlay scrim at the *current* appearance, quoted in dark-mode terms
@@ -895,6 +864,22 @@ fn modal_with(
 pub enum Side {
     Left,
     Right,
+    /// Up from the bottom edge, full width — the shape a phone puts a picker
+    /// or a share list in, and what a narrow window wants instead of a side
+    /// panel that leaves no room for the page behind it.
+    Bottom,
+}
+
+impl Side {
+    /// Which way the panel travels. The extent a [`sheet`] is given is read
+    /// along this axis: a width for the vertical edges, a height for the
+    /// horizontal one.
+    fn axis(self) -> gpui::Axis {
+        match self {
+            Side::Left | Side::Right => gpui::Axis::Horizontal,
+            Side::Bottom => gpui::Axis::Vertical,
+        }
+    }
 }
 
 /// Corner rounding of [`dialog_card`], and of a [`sheet_panel`]'s two inner
@@ -904,9 +889,9 @@ pub enum Side {
 /// the blur under each — which is exactly why it is not a literal.
 const DIALOG_RADIUS: f32 = 16.0;
 
-/// The full-height panel body of a [`sheet`]: glass card chrome rounded and
-/// hairlined on its *inner* edge only, so it reads as pulled out of the window
-/// side rather than floating near it.
+/// The panel body of a [`sheet`]: glass card chrome rounded and hairlined on
+/// its *inner* edge only — the corners against the window edge are off-screen
+/// — so it reads as pulled out of the window rather than floating near it.
 pub fn sheet_panel(theme: &Theme, side: Side) -> gpui::Div {
     let card = div()
         .size_full()
@@ -923,6 +908,10 @@ pub fn sheet_panel(theme: &Theme, side: Side) -> gpui::Div {
             .rounded_l(px(DIALOG_RADIUS))
             .border_l_1()
             .border_color(hairline(0.10)),
+        Side::Bottom => card
+            .rounded_t(px(DIALOG_RADIUS))
+            .border_t_1()
+            .border_color(hairline(0.10)),
     };
     if theme.glass {
         card.bg(theme.glass_overlay())
@@ -931,10 +920,14 @@ pub fn sheet_panel(theme: &Theme, side: Side) -> gpui::Div {
     }
 }
 
-/// Full-height side panel over a dim scrim — [`modal`] pinned to an edge. It
-/// slides in over [`motion::DIALOG_IN`] and, once the caller's [`Popup`]
-/// enters its exit phase, back out over [`motion::MENU_OUT`] — which it must,
-/// because [`Popup::finish_close`] reaps on that spec's span.
+/// A panel over a dim scrim — [`modal`] pinned to an edge. It slides in over
+/// [`motion::DIALOG_IN`] and, once the caller's [`Popup`] enters its exit
+/// phase, back out over [`motion::MENU_OUT`] — which it must, because
+/// [`Popup::finish_close`] reaps on that spec's span.
+///
+/// `extent` is measured across the edge the sheet is pinned to: a width on
+/// [`Side::Left`] and [`Side::Right`], a height on [`Side::Bottom`]. The other
+/// axis always spans the viewport.
 ///
 /// `on_dismiss` is the scrim click. Unlike the anchored menus, dismissal
 /// cannot be the caller's `.on_mouse_down_out`: the scrim lives inside this
@@ -947,25 +940,29 @@ pub fn sheet(
     id: impl Into<SharedString>,
     viewport: gpui::Size<Pixels>,
     side: Side,
-    width: Pixels,
+    extent: Pixels,
     content: AnyElement,
     closing: Option<web_time::Instant>,
     on_dismiss: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
 ) -> AnyElement {
     let id = id.into();
     let exit = closing.map(exit_progress);
-    let panel = div()
-        .absolute()
-        .top_0()
-        .bottom_0()
-        .w(width)
-        .child(crate::surface::popover(DIALOG_RADIUS, content));
+    // The panel spans the edge it is pinned to and takes `extent` across it,
+    // which is why the argument is not called a width: on [`Side::Bottom`] it
+    // is the height.
+    let panel = div().absolute();
+    let panel = match side.axis() {
+        gpui::Axis::Horizontal => panel.top_0().bottom_0().w(extent),
+        gpui::Axis::Vertical => panel.left_0().right_0().h(extent),
+    };
+    let panel = panel.child(crate::surface::popover(DIALOG_RADIUS, content));
     // `t` runs 0 (fully off-screen) → 1 (seated against the edge).
     let seat = move |el: gpui::Div, t: f32| {
-        let inset = width * (t - 1.0);
+        let inset = extent * (t - 1.0);
         match side {
             Side::Left => el.left(inset),
             Side::Right => el.right(inset),
+            Side::Bottom => el.bottom(inset),
         }
     };
     let panel = if let Some(t) = exit {
@@ -1031,7 +1028,7 @@ pub fn menu_row(theme: &Theme, active: bool, fade: Option<Fade>) -> gpui::Div {
         .text_style(TextStyle::Body)
         .cursor_pointer();
     match (active, fade) {
-        (true, _) => row.bg(theme::card_selected_bg()).text_color(theme.text),
+        (true, _) => row.bg(theme.card_selected_bg()).text_color(theme.text),
         (false, None) => row.text_color(theme.text.opacity(0.9)),
         (false, Some(fade)) => {
             let mut row = row
@@ -1146,7 +1143,11 @@ pub fn key_hint(theme: &Theme, icon: impl Into<Icon>, label: &'static str) -> gp
 
 /// A footer legend whose cap holds a WORD ("tab", "esc") instead of a glyph
 /// — for keys with no icon in the set.
-pub fn key_hint_text(theme: &Theme, cap: &'static str, label: &'static str) -> gpui::Div {
+pub fn key_hint_text(
+    theme: &Theme,
+    cap: impl Into<SharedString>,
+    label: &'static str,
+) -> gpui::Div {
     div()
         .flex()
         .flex_row()
@@ -1157,7 +1158,7 @@ pub fn key_hint_text(theme: &Theme, cap: &'static str, label: &'static str) -> g
                 .text_style(TextStyle::Subheadline)
                 .font_family(theme.font_mono.clone())
                 .text_color(theme.text_muted.opacity(0.7))
-                .child(SharedString::from(cap)),
+                .child(cap.into()),
         )
         .child(key_hint_label(theme, label))
 }

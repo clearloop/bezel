@@ -15,6 +15,21 @@ theme
     .child(theme.breadcrumb_item("widgets.rs", true))
 ```
 
-The separators are children rather than something the container inserts, because a trail that collapses in the middle — `crates / … / widgets.rs` — is the caller's decision about its own path, not a rule the container could apply.
+Separators are children rather than something the container inserts, so collapsing a long trail to `crates / … / widgets.rs` stays the caller's decision.
 
-A `current` crumb takes the text tone and drops the pointer cursor. The rest truncate individually, and the container sets `min_w_0` so a long path shortens rather than pushing its row wide.
+## API
+
+```rust
+pub trait Content: ThemeExt {
+    /// The row. `min_w_0`, so a long path shortens instead of widening it.
+    fn breadcrumb(&self) -> Div;
+
+    /// One crumb; `current` takes the text tone and drops the pointer cursor.
+    fn breadcrumb_item(&self, label: impl Into<SharedString>, current: bool) -> Div;
+
+    /// The chevron between two.
+    fn breadcrumb_separator(&self) -> Svg;
+
+    // ...
+}
+```

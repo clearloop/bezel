@@ -8,24 +8,45 @@ use ui::widgets::{self, Controls, SliderDrag};
 
 focus::focusable(&theme, &self.slider, theme.slider(self.level))
     .id("slider")
-    .on_drag(SliderDrag, |_, _, _, cx| cx.new(|_| gpui::Empty))
+    .on_drag(SliderDrag("slider".into()), |_, _, _, cx| cx.new(|_| gpui::Empty))
     .on_drag_move(cx.listener(|view, event: &DragMoveEvent<SliderDrag>, _, cx| {
-        view.level = widgets::axis_fraction(
-            event.event.position, event.bounds, Axis::Horizontal, 0.0,
-        );
+        let Some(fraction) = widgets::slider_fraction(event, "slider", cx) else {
+            return;
+        };
+        view.level = fraction;
         cx.notify();
     }))
 ```
 
-The element *is* the drag source, so the gesture is grab-anywhere-and-slide rather than aim-at-the-knob. `axis_fraction` turns a pointer position into the value: where the pointer falls along an axis as a fraction of the bounds, clamped to `min..=1-min`. A slider passes `0.0` because it has no dead zone; a split passes one so neither pane can be squeezed away. On a zero-extent container — the frame before layout has run — it answers `min` instead of dividing by zero.
+The element *is* the drag source, so the gesture is grab-anywhere-and-slide rather than aim-at-the-knob.
 
-`SliderDrag` is a type of its own so two sliders in one window never answer each other's `on_drag_move`.
-
-Keyboard is `←`/`→`, which arrive as `focus::Decrement` and `focus::Increment`:
+## Keyboard
 
 ```rust
 .on_action(cx.listener(|view, _: &focus::Decrement, _, cx| view.nudge(-STEP, cx)))
 .on_action(cx.listener(|view, _: &focus::Increment, _, cx| view.nudge(STEP, cx)))
 ```
 
-The actions carry no step. Only the caller knows the range, and a library that picked one would be picking it for a percentage and a font size alike.
+## API
+
+```rust
+pub trait Controls: ThemeExt {
+    fn slider(&self, fraction: f32) -> Div;
+
+    // ...
+}
+
+/// Where the drag lands on the track it is asked about, or `None` when the
+/// gesture belongs to another slider.
+pub fn slider_fraction(
+    event: &DragMoveEvent<SliderDrag>,
+    id: impl Into<ElementId>,
+    cx: &App,
+) -> Option<f32>;
+
+/// A type of its own, so two sliders never answer each other's `on_drag_move`;
+/// the id inside it is which one the gesture started on.
+pub struct SliderDrag(pub ElementId);
+```
+
+`focus::Decrement` and `focus::Increment` are `←`/`→`. They carry no step: only the caller knows the range.

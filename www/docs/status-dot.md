@@ -11,6 +11,16 @@ widgets::status_dot(theme.busy)
 widgets::status_dot(theme.danger)
 ```
 
-The only parameter is the color. "Working", "idle", "failed" are the caller's domain, so the mapping from a state to a tone stays there rather than becoming an enum in the library that every app has to translate into.
+"Working", "idle", "failed" are the caller's domain, so the mapping from a state to a tone stays there rather than becoming an enum every app has to translate.
 
-The palette carries the tones worth using: `success`, `busy`, `warning`, `danger`, and `text_faint` for a bead that means nothing in particular yet.
+## API
+
+```rust
+// ui::widgets
+
+/// A 6px bead. The tones worth reaching for are `success`, `busy`, `warning`,
+/// `danger`, and `text_faint` for one that means nothing yet.
+pub fn status_dot(tone: gpui::Hsla) -> gpui::Div;
+
+// ...
+```

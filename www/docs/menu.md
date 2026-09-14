@@ -3,8 +3,6 @@ title: Menu
 description: The floating card, its rows, headings and dividers — plus the anchored layers that hang one off a trigger.
 ---
 
-A menu is a card and a list of rows, assembled by the caller:
-
 ```rust
 use motion::{Fade, Painter};
 use ui::popover;
@@ -23,56 +21,34 @@ popover::popover_card(&theme).w(px(240.0)).children([
 ])
 ```
 
-`active` is the row the cursor is on, and a menu has exactly one cursor. The fade is the other half: `Some(fade)` lets the mouse light a row by itself — the view that paints it plus a key unique app-wide and stable across frames, the row's id string being a good choice — and `None` is for a menu that owns an active index and moves it from `on_mouse_move` itself.
+`active` is the row the cursor is on, and a menu has exactly one cursor. Pass `Some(fade)` to let the mouse light rows by itself, `None` when the menu owns an active index and moves it from `on_mouse_move`.
 
-To float it, hang an anchored layer off the trigger while open:
+## Floating it
 
 ```rust
 trigger.child(popover::anchored_menu_below("theme-menu", card, self.menu.closing_since()))
 ```
 
-The third argument is the exit clock — `None` for a menu that simply disappears, and a `Popup`'s `closing_since()` when the close should animate.
-
-`anchored_menu` pins to the trigger's top-left, which reads right for a context-style menu and covers a button-shaped trigger — hence `anchored_menu_below` for dropdowns, `anchored_menu_above` for anything near the window's bottom edge, and `anchored_menu_above_end` when a right-side trigger would otherwise run off the window. gpui's `anchored` does not flip sides for you; the caller picks.
-
-Every layer occludes. Hitboxes are paint-order only in gpui, so without it a click on a menu row would *also* fire whatever clickable sits underneath.
-
-Dismissal is the caller's `.on_mouse_down_out` on the card. To animate the close rather than have the menu vanish, hold the state in a `Popup`:
+## Closing
 
 ```rust
 if self.menu.begin_close() {
-    popover::reap_popup(cx, |view: &mut Self| &mut view.menu);
+    popover::reap_popup(self, cx, |view: &mut Self| &mut view.menu);
 }
 ```
 
-gpui unmounts an element the frame its state drops, so a closing animation needs the state held alive while `menu-out` plays. `Popup` is that hold: `is_open` for logic — a closing popup already reads as closed — and `get`/`is_closing` for rendering, with `reap_popup` scheduling the drop once the exit's span is up.
+gpui unmounts an element the frame its state drops, so `Popup` is what holds it alive while `menu-out` plays.
 
 ## Described rows
-
-A row whose name does not say enough carries a second line, and hover text for the part of it that does not fit:
 
 ```rust
 menu::Item::action("Open…")
     .with_long_description("Choose a markdown file from this workspace to edit")
 ```
 
-The description is one line, clipped. Rows of a menu are a column of equal things, and a sentence that wrapped would stand two or three times its neighbours' height — so one described row widens the panel to a width of its own (280px), the way one icon opens the glyph gutter, and the line ends in an ellipsis there. A caller cannot do that cutting from outside: it would be counting characters against a proportional font at a width only the panel knows.
-
-`with_long_description` is the description and the hover text from one string, since a sentence that needs clipping is one no caller should write twice. `with_tooltip` sets the hover text alone: it is where the rest of a sentence goes, and it is also how a disabled row says why it is disabled — a disabled row takes no click, but it still takes a tooltip. None of them touch anything but an action row: a submenu row is hovered to open it, so a tooltip there would fight the panel it drops.
+One clipped line under the title, which widens the panel to 280px. `with_tooltip` sets hover text alone, including why a disabled row is disabled.
 
 ## Submenus
-
-`menu::card` takes rows rather than elements, and a row can be a menu of its own — the shape a SwiftUI `Menu` nests in a `Menu`:
-
-```rust
-menu::Item::submenu("Open Recent", vec![
-    menu::Item::action("bezel.md"),
-    menu::Item::Separator,
-    menu::Item::action("Clear Menu"),
-])
-```
-
-The panels are painted by `card` itself, so nesting costs the caller nothing beyond one piece of state: a `menu::Cursor`, holding which submenus are down and which row is live.
 
 ```rust
 menu::card(&theme, "file-menu", &items, &self.cursor, cx, |view, hit, _, cx| match hit {
@@ -84,16 +60,71 @@ menu::card(&theme, "file-menu", &items, &self.cursor, cx, |view, hit, _, cx| mat
 })
 ```
 
-A `Hit` carries a **path** — one row index per level, outermost first. `menu::at(items, path)` turns it back into the `Item`.
+One cursor, both devices: the pointer moves the cursor rather than lighting a row of its own, so an open submenu can only hang off the row that is live. Hover, click and `right` all arrive as `Hit::Point`.
 
-One cursor, both devices. The pointer moves the cursor rather than lighting a row of its own, so an open submenu can only ever hang off the row that is live; a menu that tracked hover separately could light two rows and hang a panel off neither. Pointing at a submenu row is what opens it, which is why hover, click and `right` all arrive as `Hit::Point`.
+## API
 
-`Cursor::descend` / `ascend` are the keyboard's two levels of travel, `step` walks rows inside the innermost panel, and `lit(depth)` is which row each panel draws lit. They are pure and tested on their own.
+```rust
+// ui::popover
 
-Dismissal comes back as `Hit::Dismiss` rather than being left to an `.on_mouse_down_out` on the card, because a card sees only its own bounds: with a submenu open, a click on one of its rows lands *outside* the parent and would read as a click away. Each panel reports the press it did not contain, and the press no panel contained is the one that dismisses.
+pub fn popover_card(theme: &Theme) -> gpui::Div;
+pub fn menu_heading(theme: &Theme, label: impl Into<SharedString>) -> gpui::Div;
+pub fn menu_row(theme: &Theme, active: bool, fade: Option<Fade>) -> gpui::Div;
+pub fn divider() -> gpui::Div;
 
-`anchored_submenu` is the layer they hang on — pinned to the row's top-right and pulled back by the card's inset, so the child's first row lines up with the row that opened it and the two cards touch. The gap is zero on purpose: a strip of nothing between them is a strip the pointer crosses on its way in, and it would land on a sibling row and close what it was reaching for. gpui allows ten levels of nested deferred draws, which is the ceiling on nesting depth.
+/// Pins to the trigger's top-left. `_below` for dropdowns, `_above` and
+/// `_above_end` near the window's bottom and right edges — gpui does not flip
+/// sides for you.
+pub fn anchored_menu(
+    id: impl Into<SharedString>,
+    content: AnyElement,
+    closing: Option<web_time::Instant>,
+) -> AnyElement;
 
-A submenu with nothing selectable in it is not selectable itself — opening it would drop a panel that is a dead end — so the keyboard steps over it like any other dead row.
+/// Begin and schedule the close together.
+pub fn close_popup<V: 'static, T: 'static>(
+    view: &mut V,
+    cx: &mut gpui::Context<V>,
+    popup: impl Fn(&mut V) -> &mut Popup<T> + Copy + 'static,
+);
 
-The pure parts are separate and tested on their own: `menu_step` wraps the active row at both ends, `filter_indices` ranks prefix matches ahead of substring matches, and `Filter` holds the items, the ranked view and the active row for every picker in the library.
+// ...
+```
+
+```rust
+// ui::menu
+
+/// Paints every panel; the caller holds one `Cursor`.
+pub fn card<V: 'static>(
+    theme: &Theme,
+    id: impl Into<SharedString>,
+    items: &[Item],
+    cursor: &Cursor,
+    cx: &mut Context<V>,
+    on: impl Fn(&mut V, Hit, &mut Window, &mut Context<V>) + 'static,
+) -> gpui::Div;
+
+/// A hit carries a path — one row index per level, outermost first.
+/// `Dismiss` comes back from the card rather than from `.on_mouse_down_out`:
+/// with a submenu open, a click on its rows lands outside the parent.
+pub enum Hit { Point(Vec<usize>), Choose(Vec<usize>), Dismiss }
+
+pub fn at<'a>(items: &'a [Item], path: &[usize]) -> Option<&'a Item>;
+
+impl Cursor {
+    /// Keyboard travel, pure and tested on its own.
+    pub fn step(&mut self, root: &[Item], delta: isize);
+    pub fn descend(&mut self, root: &[Item]) -> bool;
+    pub fn ascend(&mut self) -> bool;
+
+    /// Which row each panel draws lit.
+    pub fn lit(&self, depth: usize) -> Option<usize>;
+
+    /// Hover, click and `right` all arrive here.
+    pub fn point_at(&mut self, root: &[Item], path: &[usize]) -> bool;
+
+    // ...
+}
+```
+
+Every layer occludes — hitboxes are paint-order only in gpui, so without it a click on a row would also fire whatever sits underneath.

@@ -26,13 +26,13 @@ use ui::{
     hover_card::HoverCard,
     icons::{self, Icon},
     input::{self, Shape, TextField},
-    list, loaders,
+    keys, list, loaders,
     menu::Item,
     menubar::{self, Menu, Menubar, MenubarEvent},
     pagination,
     palette::{self, CommandPalette, PaletteEvent},
     popover,
-    scroll::{self, ScrollbarState, TransientState},
+    scroll::{self, Axes, ScrollbarState, TransientState},
     stats::{self, Stats},
     surface::Surfaced as _,
     table::{self, Column, Sort, Width},
@@ -482,6 +482,20 @@ fn demo_menus() -> Vec<Menu> {
     ]
 }
 
+/// One named demo inside a section, and the unit both surfaces are built from:
+/// the gallery stacks them under their titles, and a doc page names one on a
+/// snippet to put it in the preview beside it.
+pub struct Example {
+    /// What a snippet's ``` ```rust example=<key> ``` names, and what `?e=`
+    /// embeds. Unique within its section, not across the catalog.
+    pub key: &'static str,
+    pub title: &'static str,
+}
+
+const fn example(key: &'static str, title: &'static str) -> Example {
+    Example { key, title }
+}
+
 /// One page of the browser.
 pub struct Section {
     /// Rail key, and what [`Gallery::section_body`] matches on.
@@ -491,6 +505,10 @@ pub struct Section {
     /// source, so the path is the most useful line of documentation there is.
     /// `None` for a component the rail lists but the library has not built.
     pub source: Option<&'static str>,
+    /// The demos on this page, in the order they are painted. Empty while a
+    /// section is still one undivided body: the page renders it whole and its
+    /// doc page gets a single preview.
+    pub examples: &'static [Example],
 }
 
 /// A rail group.
@@ -504,6 +522,23 @@ const fn section(key: &'static str, title: &'static str, source: &'static str) -
         key,
         title,
         source: Some(source),
+        examples: &[],
+    }
+}
+
+/// A section split into named examples — what a restructured page is declared
+/// with, and what lets a doc page put each preview beside its own snippet.
+const fn section_of(
+    key: &'static str,
+    title: &'static str,
+    source: &'static str,
+    examples: &'static [Example],
+) -> Section {
+    Section {
+        key,
+        title,
+        source: Some(source),
+        examples,
     }
 }
 
@@ -522,6 +557,7 @@ const fn planned(key: &'static str, title: &'static str) -> Section {
         key,
         title,
         source: None,
+        examples: &[],
     }
 }
 
@@ -678,7 +714,20 @@ pub const COMPONENTS: &[Group] = &[
     Group {
         title: "Selection & input",
         sections: &[
-            section("buttons", "Buttons", "crates/ui/src/widgets/buttons.rs"),
+            section_of(
+                "buttons",
+                "Buttons",
+                "crates/ui/src/widgets/buttons.rs",
+                &[
+                    example("basic", "Basic"),
+                    example("styles", "Styles"),
+                    example("icon", "Icon"),
+                    example("group", "Control group"),
+                    example("capsule", "Capsule"),
+                    example("lensed", "Lensed"),
+                    example("ghost", "Ghost frame"),
+                ],
+            ),
             section("text-field", "Text field", "crates/ui/src/input.rs"),
             section("textarea", "Textarea", "crates/ui/src/input.rs"),
             section("select", "Select", "crates/ui/src/widgets/controls.rs"),
@@ -845,7 +894,9 @@ pub struct Gallery {
     /// What it last reported. The bar keeps no selection — a menu item is an
     /// action, not a value — so the host is where the answer lands.
     last_menu_item: Option<SharedString>,
-    sheet: popover::Popup<()>,
+    /// Which edge the open sheet is pinned to — the page offers both, and
+    /// the mount below reads it back rather than keeping a second flag.
+    sheet: popover::Popup<popover::Side>,
     /// The rail, when the window is too narrow to carry it beside the pane.
     drawer: popover::Popup<()>,
     /// Where the split's divider sits, as a fraction of the container.
@@ -988,6 +1039,10 @@ pub struct Gallery {
     /// The website embeds a page per component this way, so a doc page shows
     /// the component it documents rather than the whole browser.
     embedded: bool,
+    /// Which [`Example`] the embed is showing, of the section it opened on.
+    /// `None` is the whole page. A doc page holds one embed and moves it from
+    /// snippet to snippet, so this changes without the window reloading.
+    example: Option<SharedString>,
 }
 
 impl Gallery {
@@ -1155,6 +1210,7 @@ impl Gallery {
             probe_disp: Theme::of(cx).glass_dispersion,
             probe_fill: 0.34,
             embedded: false,
+            example: None,
         }
     }
 
@@ -1193,11 +1249,25 @@ impl Gallery {
     }
 
     /// That section *alone*, for a website page that documents it — no rail, no
-    /// tabs, just the pane.
-    pub fn embedded(key: &str, cx: &mut Context<Self>) -> Self {
+    /// tabs, just the pane. `example` narrows it further to one demo on the
+    /// page, which is what a doc page's preview shows.
+    pub fn embedded(key: &str, example: Option<&str>, cx: &mut Context<Self>) -> Self {
         let mut gallery = Self::showing(key, cx);
         gallery.embedded = tab_of(key).is_some();
+        gallery.example = example.map(SharedString::from);
         gallery
+    }
+
+    /// Point the embed at another example of the section it is already on —
+    /// what a doc page sends as the reader scrolls from snippet to snippet.
+    /// `None` widens it back to the whole page.
+    pub fn show_example(&mut self, example: Option<&str>, cx: &mut Context<Self>) {
+        let example = example.map(SharedString::from);
+        if self.example == example {
+            return;
+        }
+        self.example = example;
+        cx.notify();
     }
 
     /// The gallery's own focus handle — what the window focuses on launch.
@@ -1374,7 +1444,7 @@ impl Gallery {
 
     fn close_context_menu(&mut self, cx: &mut Context<Self>) {
         if self.context_menu.begin_close() {
-            popover::reap_popup(cx, |view: &mut Self| &mut view.context_menu);
+            popover::reap_popup(self, cx, |view: &mut Self| &mut view.context_menu);
         }
         cx.notify();
     }
@@ -1402,7 +1472,7 @@ impl Gallery {
 
     fn close_sheet(&mut self, cx: &mut Context<Self>) {
         if self.sheet.begin_close() {
-            popover::reap_popup(cx, |view: &mut Self| &mut view.sheet);
+            popover::reap_popup(self, cx, |view: &mut Self| &mut view.sheet);
         }
         cx.notify();
     }
@@ -1414,7 +1484,7 @@ impl Gallery {
 
     fn close_drawer(&mut self, cx: &mut Context<Self>) {
         if self.drawer.begin_close() {
-            popover::reap_popup(cx, |view: &mut Self| &mut view.drawer);
+            popover::reap_popup(self, cx, |view: &mut Self| &mut view.drawer);
         }
         cx.notify();
     }
@@ -1473,7 +1543,7 @@ impl Gallery {
                     .flex_row()
                     .items_center()
                     .gap(px(18.0))
-                    .when(compact, |strip| strip.overflow_x_scroll())
+                    .when(compact, |strip| scroll::scrolls(strip, Axes::Horizontal))
                     .children(TABS.iter().enumerate().map(|(index, tab)| {
                         let selected = index == current;
                         let mut item = div()
@@ -1601,6 +1671,267 @@ impl Gallery {
                         .text_color(theme.text_faint),
                     ),
             )
+            .into_any_element()
+    }
+
+    /// Every button face, the groupings they gather into, and the ghost frame
+    /// a caller fills itself.
+    fn buttons(&mut self, cx: &mut Context<Self>) -> Vec<(&'static str, AnyElement)> {
+        let theme = Theme::of(cx).clone();
+        let view = Painter::of(cx);
+        let labels = ["Ghost", "Prominent", "Destructive"];
+        let faces = [
+            theme.button(
+                labels[0],
+                ButtonStyle::Ghost,
+                Some(Fade::new(view, "g-ghost")),
+            ),
+            theme.button(labels[1], ButtonStyle::Prominent, None),
+            theme.button(labels[2], ButtonStyle::Destructive, None),
+        ];
+        let glyphs = [
+            (icons::glyph::Pen, ButtonStyle::Ghost, "pen"),
+            (icons::glyph::Plus, ButtonStyle::Prominent, "plus"),
+            (icons::glyph::Trash, ButtonStyle::Destructive, "trash"),
+        ];
+        let toolbar = [
+            (icons::glyph::PanelLeft, "sidebar"),
+            (icons::glyph::Search, "search"),
+            (icons::glyph::Settings, "settings"),
+        ];
+        let cluster = theme
+            .control_group()
+            .children(toolbar.into_iter().map(|(glyph, name)| {
+                theme
+                    .icon_button(glyph, ButtonStyle::Ghost, Some(Fade::new(view, name)))
+                    .id(name)
+                    .on_click(cx.listener(move |view, _, _, cx| view.press(name, cx)))
+                    .into_any_element()
+            }));
+        let texts = theme
+            .control_group()
+            .children(["Cut", "Copy", "Paste"].into_iter().map(|label| {
+                theme
+                    .button(label, ButtonStyle::Ghost, Some(Fade::new(view, label)))
+                    .control_size(ControlSize::Small)
+                    .id(label)
+                    .on_click(cx.listener(move |view, _, _, cx| view.press(label, cx)))
+                    .into_any_element()
+            }));
+        let capsule = theme.control_group().rounded_full().children(
+            [
+                (icons::glyph::ChevronLeft, "back"),
+                (icons::glyph::ChevronRight, "forward"),
+            ]
+            .into_iter()
+            .map(|(glyph, name)| {
+                theme
+                    .icon_button(glyph, ButtonStyle::Ghost, Some(Fade::new(view, name)))
+                    .rounded_full()
+                    .id(name)
+                    .on_click(cx.listener(move |view, _, _, cx| view.press(name, cx)))
+                    .into_any_element()
+            }),
+        );
+        let lensed = row().children(toolbar.into_iter().map(|(glyph, name)| {
+            theme
+                .icon_button(
+                    glyph,
+                    ButtonStyle::Ghost,
+                    Some(Fade::new(view, format!("lens-{name}"))),
+                )
+                .rounded_full()
+                .id(SharedString::from(format!("lens-{name}")))
+                .on_click(cx.listener(move |view, _, _, cx| view.press(name, cx)))
+                .surface(&theme, theme.popover_surface)
+                .into_any_element()
+        }));
+        let split = theme
+            .control_group()
+            .child(
+                theme
+                    .button("Save", ButtonStyle::Prominent, None)
+                    .id("group-save")
+                    .on_click(cx.listener(|view, _, _, cx| view.press("Save", cx))),
+            )
+            .child(
+                theme
+                    .icon_button(
+                        icons::glyph::ChevronDown,
+                        ButtonStyle::Ghost,
+                        Some(Fade::new(view, "group-more")),
+                    )
+                    .id("group-more")
+                    .on_click(cx.listener(|view, _, _, cx| view.press("more", cx))),
+            );
+
+        let basic = stack()
+            .child(
+                row()
+                    .child(
+                        ui::widgets::Button::new("semantic-save", "Save")
+                            .button_style(ButtonStyle::Prominent)
+                            .on_press(cx.listener(|view, _, _, cx| view.press("Save", cx))),
+                    )
+                    .child(
+                        ui::widgets::Button::new("semantic-delete", "Delete")
+                            .role(ui::widgets::ButtonRole::Destructive)
+                            .icon(icons::glyph::Trash)
+                            .on_press(cx.listener(|view, _, _, cx| view.press("Delete", cx))),
+                    )
+                    .child(
+                        ui::widgets::Button::new("semantic-disabled", "Unavailable")
+                            .enabled(false)
+                            .on_press(cx.listener(|view, _, _, cx| view.press("Unavailable", cx))),
+                    ),
+            )
+            .when_some(self.last_pressed.clone(), |page, label| {
+                page.child(
+                    div()
+                        .text_style(TextStyle::Callout)
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(format!("pressed: {label}"))),
+                )
+            });
+
+        let styles = row().children(faces.into_iter().enumerate().map(|(index, face)| {
+            pressable(
+                focus::focusable(&theme, &self.buttons[index], face),
+                SharedString::from(format!("button-{index}")),
+                cx,
+                move |view, cx| view.press(labels[index], cx),
+            )
+            .into_any_element()
+        }));
+
+        let icon = row().children(glyphs.into_iter().enumerate().map(
+            |(index, (glyph, style, name))| {
+                pressable(
+                    focus::focusable(
+                        &theme,
+                        &self.icon_buttons[index],
+                        theme.icon_button(glyph, style, None),
+                    ),
+                    SharedString::from(format!("icon-button-{index}")),
+                    cx,
+                    move |view, cx| view.press(name, cx),
+                )
+                .into_any_element()
+            },
+        ));
+
+        let ghost = row()
+            .child(
+                theme
+                    .ghost("ghost-menu")
+                    .p(px(5.0))
+                    .child(
+                        icons::icon(icons::glyph::Ellipsis)
+                            .size(px(14.0))
+                            .text_color(theme.text_faint),
+                    )
+                    .on_click(cx.listener(|view, _, _, cx| view.press("menu", cx))),
+            )
+            .child(
+                theme
+                    .ghost("ghost-new")
+                    .px(px(8.0))
+                    .py(px(4.0))
+                    .gap(px(6.0))
+                    .text_style(TextStyle::Callout)
+                    .text_color(theme.text_muted)
+                    .child(
+                        icons::icon(icons::glyph::Plus)
+                            .size(px(13.0))
+                            .text_color(theme.text_faint),
+                    )
+                    .child("New")
+                    .on_click(cx.listener(|view, _, _, cx| view.press("New", cx))),
+            );
+
+        vec![
+            ("basic", basic.into_any_element()),
+            ("styles", styles.into_any_element()),
+            ("icon", icon.into_any_element()),
+            (
+                "group",
+                stack()
+                    .child(row().child(cluster).child(split))
+                    .child(row().child(texts))
+                    .into_any_element(),
+            ),
+            ("capsule", row().child(capsule).into_any_element()),
+            ("lensed", lensed.into_any_element()),
+            ("ghost", ghost.into_any_element()),
+        ]
+    }
+
+    /// The section's demos, keyed by [`Example::key`]. A section still written
+    /// as one undivided body answers with a single unkeyed element.
+    fn examples(
+        &mut self,
+        section: &'static Section,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<(&'static str, AnyElement)> {
+        match section.key {
+            "buttons" => self.buttons(cx),
+            _ => vec![("", self.section_body(section.key, window, cx))],
+        }
+    }
+
+    /// The example keys this section actually paints. The catalog declares
+    /// them and [`Self::examples`] produces them; comparing the two is what
+    /// keeps a doc page's `example=` from pointing at nothing.
+    pub fn painted(
+        &mut self,
+        section: &'static Section,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<&'static str> {
+        self.examples(section, window, cx)
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect()
+    }
+
+    /// What the pane paints: every example stacked under its title, or — when
+    /// a doc page has pointed the embed at one — that example alone, with no
+    /// caption, since the page beside it is already the heading.
+    ///
+    /// An example key the section does not carry widens back to the whole page
+    /// rather than emptying the pane, so a stale doc link still shows the
+    /// component.
+    fn body(
+        &mut self,
+        section: &'static Section,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let mut examples = self.examples(section, window, cx);
+        if let Some(key) = self.example.clone()
+            && let Some(index) = examples.iter().position(|(k, _)| *k == key.as_ref())
+        {
+            return examples.swap_remove(index).1;
+        }
+        if examples.len() == 1 {
+            return examples.remove(0).1;
+        }
+        stack()
+            .children(examples.into_iter().map(|(key, element)| {
+                let title = section
+                    .examples
+                    .iter()
+                    .find(|example| example.key == key)
+                    .map(|example| example.title);
+                stack()
+                    .when_some(title, |column, title| {
+                        column.child(popover::menu_heading(&theme, title))
+                    })
+                    .child(element)
+                    .into_any_element()
+            }))
             .into_any_element()
     }
 
@@ -2035,204 +2366,6 @@ impl Gallery {
             }
 
             // ---- Components --------------------------------------------------
-            "buttons" => {
-                let labels = ["Ghost", "Prominent", "Destructive"];
-                let faces = [
-                    theme.button(
-                        labels[0],
-                        ButtonStyle::Ghost,
-                        Some(Fade::new(view, "g-ghost")),
-                    ),
-                    theme.button(labels[1], ButtonStyle::Prominent, None),
-                    theme.button(labels[2], ButtonStyle::Destructive, None),
-                ];
-                let glyphs = [
-                    (icons::glyph::Pen, ButtonStyle::Ghost, "pen"),
-                    (icons::glyph::Plus, ButtonStyle::Prominent, "plus"),
-                    (icons::glyph::Trash, ButtonStyle::Destructive, "trash"),
-                ];
-                let toolbar = [
-                    (icons::glyph::PanelLeft, "sidebar"),
-                    (icons::glyph::Search, "search"),
-                    (icons::glyph::Settings, "settings"),
-                ];
-                let cluster =
-                    theme
-                        .control_group()
-                        .children(toolbar.into_iter().map(|(glyph, name)| {
-                            theme
-                                .icon_button(glyph, ButtonStyle::Ghost, Some(Fade::new(view, name)))
-                                .id(name)
-                                .on_click(cx.listener(move |view, _, _, cx| view.press(name, cx)))
-                                .into_any_element()
-                        }));
-                let texts =
-                    theme
-                        .control_group()
-                        .children(["Cut", "Copy", "Paste"].into_iter().map(|label| {
-                            theme
-                                .button(label, ButtonStyle::Ghost, Some(Fade::new(view, label)))
-                                .control_size(ControlSize::Small)
-                                .id(label)
-                                .on_click(cx.listener(move |view, _, _, cx| view.press(label, cx)))
-                                .into_any_element()
-                        }));
-                let capsule = theme.control_group().rounded_full().children(
-                    [
-                        (icons::glyph::ChevronLeft, "back"),
-                        (icons::glyph::ChevronRight, "forward"),
-                    ]
-                    .into_iter()
-                    .map(|(glyph, name)| {
-                        theme
-                            .icon_button(glyph, ButtonStyle::Ghost, Some(Fade::new(view, name)))
-                            .rounded_full()
-                            .id(name)
-                            .on_click(cx.listener(move |view, _, _, cx| view.press(name, cx)))
-                            .into_any_element()
-                    }),
-                );
-                let lensed = row().children(toolbar.into_iter().map(|(glyph, name)| {
-                    theme
-                        .icon_button(
-                            glyph,
-                            ButtonStyle::Ghost,
-                            Some(Fade::new(view, format!("lens-{name}"))),
-                        )
-                        .rounded_full()
-                        .id(SharedString::from(format!("lens-{name}")))
-                        .on_click(cx.listener(move |view, _, _, cx| view.press(name, cx)))
-                        .surface(&theme, theme.popover_surface)
-                        .into_any_element()
-                }));
-                let split = theme
-                    .control_group()
-                    .child(
-                        theme
-                            .button("Save", ButtonStyle::Prominent, None)
-                            .id("group-save")
-                            .on_click(cx.listener(|view, _, _, cx| view.press("Save", cx))),
-                    )
-                    .child(
-                        theme
-                            .icon_button(
-                                icons::glyph::ChevronDown,
-                                ButtonStyle::Ghost,
-                                Some(Fade::new(view, "group-more")),
-                            )
-                            .id("group-more")
-                            .on_click(cx.listener(|view, _, _, cx| view.press("more", cx))),
-                    );
-                section
-                    .child(hint(
-                        &theme,
-                        "tab and shift-tab walk these, and every field and combobox \
-                         in the gallery, in the order they are painted. enter or \
-                         space presses the focused one.",
-                    ))
-                    .child(
-                        row().children(faces.into_iter().enumerate().map(|(index, face)| {
-                            pressable(
-                                focus::focusable(&theme, &self.buttons[index], face),
-                                SharedString::from(format!("button-{index}")),
-                                cx,
-                                move |view, cx| view.press(labels[index], cx),
-                            )
-                            .into_any_element()
-                        })),
-                    )
-                    .child(hint(
-                        &theme,
-                        "the same three styles with a glyph where the label goes. \
-                         square at the height the labeled button already stands, so \
-                         the two line up wherever they meet.",
-                    ))
-                    .child(row().children(glyphs.into_iter().enumerate().map(
-                        |(index, (glyph, style, name))| {
-                            pressable(
-                                focus::focusable(
-                                    &theme,
-                                    &self.icon_buttons[index],
-                                    theme.icon_button(glyph, style, None),
-                                ),
-                                SharedString::from(format!("icon-button-{index}")),
-                                cx,
-                                move |view, cx| view.press(name, cx),
-                            )
-                            .into_any_element()
-                        },
-                    )))
-                    .child(hint(
-                        &theme,
-                        "a control group gathers the buttons beside it onto one \
-                         background, the way a toolbar does with the items it finds \
-                         adjacent. a second cluster is a second group.",
-                    ))
-                    .child(row().child(cluster).child(split))
-                    .child(row().child(texts))
-                    .child(hint(
-                        &theme,
-                        "cut both the track and its items round and the group is the \
-                         capsule a macOS 26 toolbar carries its back and forward pair \
-                         in. nothing has a radius to pick: a round track and a round \
-                         item are concentric wherever the inset lands.",
-                    ))
-                    .child(row().child(capsule))
-                    .child(hint(
-                        &theme,
-                        "cut the same button to a circle, hand it the surface the \
-                         theme already names, and it is the control a macOS 26 \
-                         toolbar floats. the lens paints the fill, so the wash a \
-                         ghost hovers with is gone and only the glyph still lifts.",
-                    ))
-                    .child(lensed)
-                    .child(hint(
-                        &theme,
-                        "the ghost frame below carries its own click and tooltip and \
-                         leaves padding and children to the caller, which is what lets \
-                         a glyph sit before the text.",
-                    ))
-                    .child(
-                        row()
-                            .child(
-                                theme
-                                    .ghost("ghost-menu")
-                                    .p(px(5.0))
-                                    .child(
-                                        icons::icon(icons::glyph::Ellipsis)
-                                            .size(px(14.0))
-                                            .text_color(theme.text_faint),
-                                    )
-                                    .on_click(cx.listener(|view, _, _, cx| view.press("menu", cx))),
-                            )
-                            .child(
-                                theme
-                                    .ghost("ghost-new")
-                                    .px(px(8.0))
-                                    .py(px(4.0))
-                                    .gap(px(6.0))
-                                    .text_style(TextStyle::Callout)
-                                    .text_color(theme.text_muted)
-                                    .child(
-                                        icons::icon(icons::glyph::Plus)
-                                            .size(px(13.0))
-                                            .text_color(theme.text_faint),
-                                    )
-                                    .child("New")
-                                    .on_click(cx.listener(|view, _, _, cx| view.press("New", cx))),
-                            ),
-                    )
-                    .when_some(self.last_pressed.clone(), |page, label| {
-                        page.child(
-                            div()
-                                .text_style(TextStyle::Callout)
-                                .text_color(theme.text_muted)
-                                .child(SharedString::from(format!("pressed: {label}"))),
-                        )
-                    })
-                    .into_any_element()
-            }
-
             "text-field" => section
                 .child(hint(
                     &theme,
@@ -3254,7 +3387,14 @@ impl Gallery {
             "palette" => section
                 .child(
                     row()
-                        .child(popover::key_hint_text(&theme, "⌘K", "open palette"))
+                        // Read off the keymap, not typed here: this page and
+                        // `init` are two files, and a chord written in both is
+                        // a chord that drifts.
+                        .child(popover::key_hint_text(
+                            &theme,
+                            keys::shortcut(&OpenPalette, window).unwrap_or_default(),
+                            "open palette",
+                        ))
                         .when_some(self.last_command.clone(), |r, cmd| {
                             r.child(
                                 div()
@@ -3272,18 +3412,30 @@ impl Gallery {
                     "A dialog pinned to an edge; the scrim dismisses it.",
                 ))
                 .child(
-                    row().child(
-                        div()
-                            .id("open-sheet")
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                view.sheet.open(());
-                                cx.notify();
-                            }))
-                            .child(theme.button(
-                                "Open sheet",
-                                ButtonStyle::Ghost,
-                                Some(Fade::new(view, "g-sheet")),
-                            )),
+                    row().children(
+                        [
+                            ("open-sheet", "From the side", popover::Side::Right),
+                            (
+                                "open-bottom-sheet",
+                                "From the bottom",
+                                popover::Side::Bottom,
+                            ),
+                        ]
+                        .into_iter()
+                        .map(|(id, label, side)| {
+                            div()
+                                .id(id)
+                                .on_click(cx.listener(move |view, _, _, cx| {
+                                    view.sheet.open(side);
+                                    cx.notify();
+                                }))
+                                .child(theme.button(
+                                    label,
+                                    ButtonStyle::Ghost,
+                                    Some(Fade::new(view, format!("g-{id}"))),
+                                ))
+                                .into_any_element()
+                        }),
                     ),
                 )
                 .into_any_element(),
@@ -3985,10 +4137,8 @@ impl Gallery {
                         .border_color(theme.border)
                         .overflow_hidden()
                         .child(scroll::claim_wheel(
-                            div()
-                                .id("scroll-demo")
+                            scroll::pane("scroll-demo", Axes::Vertical)
                                 .size_full()
-                                .overflow_y_scroll()
                                 .track_scroll(&self.demo_scroll)
                                 .child(div().p(px(14.0)).flex().flex_col().gap(px(8.0)).children(
                                     (1..=30).map(|line| {
@@ -3999,7 +4149,7 @@ impl Gallery {
                                     }),
                                 )),
                             &self.demo_scroll,
-                            gpui::Axis::Vertical,
+                            Axes::Vertical,
                             &self.demo_claim,
                         ))
                         .child(scroll::scrollbar(
@@ -4074,10 +4224,8 @@ impl Gallery {
                         .border_color(theme.border)
                         .overflow_hidden()
                         .child(
-                            div()
-                                .id("follow-demo")
+                            scroll::pane("follow-demo", Axes::Vertical)
                                 .size_full()
-                                .overflow_y_scroll()
                                 .track_scroll(&self.log_scroll)
                                 .child(div().p(px(14.0)).flex().flex_col().gap(px(6.0)).children(
                                     (1..=self.log_lines).map(|line| {
@@ -4149,10 +4297,8 @@ impl Gallery {
                                     .relative()
                                     .h(px(150.0))
                                     .child(scroll::claim_wheel(
-                                        div()
-                                            .id("table-body")
+                                        scroll::pane("table-body", Axes::Vertical)
                                             .size_full()
-                                            .overflow_y_scroll()
                                             .track_scroll(&self.table_scroll)
                                             .children(rows.iter().enumerate().map(
                                                 |(index, (name, kind, size))| {
@@ -4182,7 +4328,7 @@ impl Gallery {
                                                 },
                                             )),
                                         &self.table_scroll,
-                                        gpui::Axis::Vertical,
+                                        Axes::Vertical,
                                         &self.table_claim,
                                     ))
                                     .child(scroll::scrollbar(
@@ -4228,10 +4374,8 @@ impl Gallery {
                             .border_color(theme.border)
                             .overflow_hidden()
                             .child(scroll::claim_wheel(
-                                div()
-                                    .id("tree-body")
+                                scroll::pane("tree-body", Axes::Vertical)
                                     .size_full()
-                                    .overflow_y_scroll()
                                     .track_scroll(&self.tree_scroll)
                                     .child(tree::tree().p(px(6.0)).children(
                                         rows.iter().enumerate().map(|(index, entry)| {
@@ -4249,7 +4393,7 @@ impl Gallery {
                                         }),
                                     )),
                                 &self.tree_scroll,
-                                gpui::Axis::Vertical,
+                                Axes::Vertical,
                                 &self.tree_claim,
                             ))
                             .child(scroll::scrollbar(
@@ -4774,7 +4918,7 @@ impl Render for Gallery {
         // that a single scroll of everything reads as a wall.
         let section =
             section_at(self.selected[self.tab]).unwrap_or(&TABS[self.tab].groups[0].sections[0]);
-        let body = self.section_body(section.key, window, cx);
+        let body = self.body(section, window, cx);
         let pane = div().relative().flex_1().min_h_0().map(|pane| {
             if TABS[self.tab].full_bleed {
                 // A pattern is a screen: it takes the pane whole and
@@ -4788,7 +4932,7 @@ impl Render for Gallery {
                     div()
                         .id("gallery-canvas")
                         .size_full()
-                        .when(compact, |canvas| canvas.overflow_scroll())
+                        .when(compact, |canvas| scroll::scrolls(canvas, Axes::Both))
                         .child(
                             div()
                                 .size_full()
@@ -4799,10 +4943,8 @@ impl Render for Gallery {
                 )
             } else {
                 pane.child(
-                    div()
-                        .id("gallery-pane")
+                    scroll::pane("gallery-pane", Axes::Vertical)
                         .size_full()
-                        .overflow_y_scroll()
                         .track_scroll(&self.pane_scroll)
                         // The column width components are designed for;
                         // several are `w_full` and would otherwise stretch
@@ -5018,13 +5160,20 @@ impl Render for Gallery {
                     cx.listener(|view, _, _, cx| view.close_dialog(cx)),
                 ))
             })
-            .when(self.sheet.get().is_some(), |root| {
+            .when_some(self.sheet.get().copied(), |root, side| {
+                // A side sheet is as wide as a rail; a bottom one is as tall
+                // as a picker, which is a different number for the same reason
+                // — it is measured across the edge it hangs off.
+                let extent = match side {
+                    popover::Side::Bottom => px(300.0),
+                    _ => px(320.0),
+                };
                 root.child(popover::sheet(
                     "gallery-sheet",
                     window.viewport_size(),
-                    popover::Side::Right,
-                    px(320.0),
-                    popover::sheet_panel(&theme, popover::Side::Right)
+                    side,
+                    extent,
+                    popover::sheet_panel(&theme, side)
                         .p(px(20.0))
                         .gap(px(14.0))
                         .child(
@@ -5050,7 +5199,7 @@ impl Render for Gallery {
                         .child(popover::dialog_body(
                             &theme,
                             "A sheet is the dialog card pinned to an edge — same scrim, \
-                             same glass, full height.",
+                             same glass, spanning whichever edge it hangs off.",
                         ))
                         .child(
                             theme

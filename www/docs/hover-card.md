@@ -14,8 +14,34 @@ div()
     .child("@clearloop")
 ```
 
-`hoverable_tooltip` rather than `tooltip` is the whole difference, and it means there is no open/close state machine here: gpui owns the delay and keeps the card alive while the pointer is inside it, which is what lets a preview hold a link you can click.
+`hoverable_tooltip` rather than `tooltip` is the whole difference: gpui owns the delay and keeps the card alive while the pointer is inside it, so there is no open/close state machine here.
 
-Two constructors. `summary` is a heading and a line or two of prose; `person` adds avatar initials beside the name and a meta line under the body — a role, a path, a timestamp.
+## For a person
 
-The card is wider and airier than a tooltip's because it holds prose rather than a label.
+```rust
+HoverCard::person("CL", "clearloop", "Builds desktop software in Rust.", "Shanghai", window, cx)
+```
+
+## API
+
+```rust
+impl HoverCard {
+    /// Heading and a line or two of prose.
+    pub fn summary(
+        title: impl Into<SharedString>,
+        body: impl Into<SharedString>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyView;
+
+    /// Adds avatar initials beside the name and a meta line under the body.
+    pub fn person(
+        initials: impl Into<SharedString>,
+        name: impl Into<SharedString>,
+        body: impl Into<SharedString>,
+        meta: impl Into<SharedString>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyView;
+}
+```

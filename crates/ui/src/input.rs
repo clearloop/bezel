@@ -20,11 +20,11 @@
 use std::{ops::Range, time::Duration};
 
 use gpui::{
-    App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, EventEmitter, FocusHandle, Focusable, Global, GlobalElementId, KeyBinding,
-    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    SharedString, Style, Task, TextRun, UTF16Selection, UnderlineStyle, Window, WrappedLine,
-    actions, div, fill, prelude::*, px, relative,
+    App, Bounds, ClipboardItem, Context, CursorStyle, DispatchPhase, ElementId,
+    ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, Global,
+    GlobalElementId, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, PaintQuad, Pixels, Point, SharedString, Style, Task, TextRun, UTF16Selection,
+    UnderlineStyle, Window, WrappedLine, actions, div, fill, prelude::*, px, relative,
 };
 use unicode_segmentation::UnicodeSegmentation as _;
 
@@ -129,26 +129,21 @@ pub const KEY_CONTEXT: &str = "TextField";
 /// every `TextField` would win the dispatch and break list navigation in both.
 pub const MULTILINE_KEY_CONTEXT: &str = "TextArea";
 
-/// Install the default key bindings. Call once at startup.
+/// Install the bindings — [`bindings`], bound. Call once at startup.
+pub fn init(cx: &mut App) {
+    cx.bind_keys(bindings());
+}
+
+/// The field's keymap, as data, so an app can have it without having to
+/// take it — see [`crate::keys`] for layering over it or taking a chord
+/// away.
 ///
 /// Every binding is scoped to [`KEY_CONTEXT`], so they are inert outside a
 /// focused field and an app is free to bind the same chords elsewhere.
-///
-/// **Optional.** This is a convenience, not a requirement: every action above
-/// is a public type, so an app that wants its own keymap simply does not call
-/// this and binds what it likes instead —
-///
-/// ```ignore
-/// use ui::input::{self, Home, KEY_CONTEXT};
-/// cx.bind_keys([KeyBinding::new("ctrl-a", Home, Some(KEY_CONTEXT))]);
-/// ```
-///
-/// It is all-or-nothing, so taking the clipboard defaults while replacing the
-/// motion ones means rebinding the lot. That is deliberate until something
-/// needs finer grain.
-pub fn init(cx: &mut App) {
+pub fn bindings() -> Vec<KeyBinding> {
+    let mut bindings = Vec::new();
     let ctx = Some(KEY_CONTEXT);
-    cx.bind_keys([
+    bindings.extend([
         // Character movement and editing, everywhere.
         KeyBinding::new("backspace", Backspace, ctx),
         KeyBinding::new("delete", Delete, ctx),
@@ -165,7 +160,7 @@ pub fn init(cx: &mut App) {
     // Multi-line only — see [`MULTILINE_KEY_CONTEXT`] for why these cannot be
     // bound on every field.
     let area = Some(MULTILINE_KEY_CONTEXT);
-    cx.bind_keys([
+    bindings.extend([
         KeyBinding::new("enter", InsertNewline, area),
         KeyBinding::new("up", Up, area),
         KeyBinding::new("down", Down, area),
@@ -174,7 +169,7 @@ pub fn init(cx: &mut App) {
     ]);
 
     #[cfg(target_os = "macos")]
-    cx.bind_keys([
+    bindings.extend([
         KeyBinding::new("cmd-a", SelectAll, ctx),
         KeyBinding::new("cmd-c", Copy, ctx),
         KeyBinding::new("cmd-x", Cut, ctx),
@@ -207,13 +202,13 @@ pub fn init(cx: &mut App) {
     // `C-n`/`C-p` are emacs' vertical motion and macOS `NSTextView` natives
     // both — the two tests a chord has to pass to earn a binding here.
     #[cfg(target_os = "macos")]
-    cx.bind_keys([
+    bindings.extend([
         KeyBinding::new("ctrl-n", Down, area),
         KeyBinding::new("ctrl-p", Up, area),
     ]);
 
     #[cfg(not(target_os = "macos"))]
-    cx.bind_keys([
+    bindings.extend([
         KeyBinding::new("ctrl-a", SelectAll, ctx),
         KeyBinding::new("ctrl-c", Copy, ctx),
         KeyBinding::new("ctrl-x", Cut, ctx),
@@ -228,6 +223,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-z", Undo, ctx),
         KeyBinding::new("ctrl-shift-z", Redo, ctx),
     ]);
+
+    bindings
 }
 
 /// What shape the field takes.
@@ -308,15 +305,7 @@ pub struct TextField {
     /// single-line field is exactly one row tall so it cannot overflow
     /// downwards. The clamp falls out of that and needs no test for shape.
     scroll: Point<Pixels>,
-    /// Points to return to, oldest first. Bounded by `undo_limit`: the field
-    /// outlives a lot of typing, and an unbounded history of a growing string
-    /// is a slow leak nothing ever reclaims.
-    undo: std::collections::VecDeque<Snapshot>,
-    /// Undone points, newest last. Cleared by any fresh edit — the usual
-    /// model, and the only one where redo cannot resurrect a branch the text
-    /// has already diverged from.
-    redo: Vec<Snapshot>,
-    undo_limit: usize,
+    history: crate::history::SnapshotHistory<Snapshot>,
     /// The kind of the last edit and the offset it left the caret at, which is
     /// what decides whether the next edit joins that group or starts a new one.
     /// Adjacency rather than a pause, so there is no timing threshold to invent.
@@ -364,9 +353,7 @@ impl TextField {
             is_selecting: false,
             goal_x: None,
             scroll: Point::default(),
-            undo: std::collections::VecDeque::new(),
-            redo: Vec::new(),
-            undo_limit: DEFAULT_UNDO_LIMIT,
+            history: crate::history::SnapshotHistory::new(DEFAULT_UNDO_LIMIT),
             last_edit: None,
             key_context: None,
             metrics: TextStyle::Body.into(),
@@ -381,7 +368,7 @@ impl TextField {
     /// theme is rebuilt on every light/dark switch, which would quietly reset
     /// anything behavioural parked in it.
     pub fn with_undo_limit(mut self, limit: usize) -> Self {
-        self.undo_limit = limit;
+        self.history.set_limit(limit);
         self
     }
 
@@ -453,8 +440,7 @@ impl TextField {
         self.content = normalize(&content.into(), self.shape).into();
         // A programmatic reset is not something the user did, so there is
         // nothing here for them to undo back past.
-        self.undo.clear();
-        self.redo.clear();
+        self.history.clear();
         self.last_edit = None;
         let end = self.content.len();
         self.selected_range = end..end;
@@ -523,8 +509,8 @@ impl TextField {
     ///
     /// `None` until the field has painted once — this is measured off the
     /// shaped layout, and there is none before then.
-    pub fn offset_bounds(&self, offset: usize, window: &Window) -> Option<Bounds<Pixels>> {
-        self.row_bounds(self.text_origin()?, offset..offset, window.line_height())
+    pub fn offset_bounds(&self, offset: usize) -> Option<Bounds<Pixels>> {
+        self.row_bounds(self.text_origin()?, offset..offset, self.line_height())
     }
 
     /// The rectangle `range` spans, starting from the row it opens on, relative
@@ -592,20 +578,20 @@ impl TextField {
         self.select_to(line_end(&self.content, self.cursor_offset()), cx);
     }
 
-    fn up(&mut self, _: &Up, window: &mut Window, cx: &mut Context<Self>) {
-        self.vertical(-1, false, window, cx);
+    fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
+        self.vertical(-1, false, cx);
     }
 
-    fn down(&mut self, _: &Down, window: &mut Window, cx: &mut Context<Self>) {
-        self.vertical(1, false, window, cx);
+    fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
+        self.vertical(1, false, cx);
     }
 
-    fn select_up(&mut self, _: &SelectUp, window: &mut Window, cx: &mut Context<Self>) {
-        self.vertical(-1, true, window, cx);
+    fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.vertical(-1, true, cx);
     }
 
-    fn select_down(&mut self, _: &SelectDown, window: &mut Window, cx: &mut Context<Self>) {
-        self.vertical(1, true, window, cx);
+    fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.vertical(1, true, cx);
     }
 
     /// Move the caret `rows` rows, keeping the goal column.
@@ -616,11 +602,11 @@ impl TextField {
     ///
     /// Geometry rather than arithmetic on line numbers, so wrapped rows and hard
     /// newlines are the same case and neither needs counting.
-    fn vertical(&mut self, rows: i32, extend: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn vertical(&mut self, rows: i32, extend: bool, cx: &mut Context<Self>) {
         if self.last_layout.is_empty() {
             return;
         }
-        let line_height = window.line_height();
+        let line_height = self.line_height();
         let Some(at) = position_for_offset(&self.last_layout, self.cursor_offset(), line_height)
         else {
             return;
@@ -753,11 +739,11 @@ impl TextField {
     fn on_mouse_down(
         &mut self,
         event: &MouseDownEvent,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.is_selecting = true;
-        let offset = self.index_for_mouse_position(event.position, window.line_height());
+        let offset = self.index_for_mouse_position(event.position, self.line_height());
         if event.modifiers.shift {
             self.select_to(offset, cx);
         } else {
@@ -775,23 +761,26 @@ impl TextField {
     fn on_scroll_wheel(
         &mut self,
         event: &gpui::ScrollWheelEvent,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let delta = event.delta.pixel_delta(window.line_height());
+        let delta = event.delta.pixel_delta(self.line_height());
         self.scroll.x = (self.scroll.x - delta.x).max(px(0.));
         self.scroll.y = (self.scroll.y - delta.y).max(px(0.));
         cx.notify();
     }
 
-    fn on_mouse_move(
-        &mut self,
-        event: &MouseMoveEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.is_selecting {
-            let offset = self.index_for_mouse_position(event.position, window.line_height());
+    /// Carry the run to wherever the pointer went. Driven by the window rather
+    /// than by the box — see [`TextFieldElement::paint`] — so `line_height` is
+    /// passed in: the field's own is only current while the field is painting.
+    fn drag_to(&mut self, position: Point<Pixels>, line_height: Pixels, cx: &mut Context<Self>) {
+        if !self.is_selecting {
+            return;
+        }
+        let offset = self.index_for_mouse_position(position, line_height);
+        // A pointer crossing a character is the event worth having; the twenty
+        // samples it takes to cross one are not.
+        if offset != self.cursor_offset() {
             self.select_to(offset, cx);
         }
     }
@@ -854,29 +843,22 @@ impl TextField {
     /// the caret, or switch from typing to deleting, and the next one starts a
     /// group of its own.
     fn push_undo(&mut self, kind: EditKind, at: usize) {
-        if !joins_group(self.last_edit, kind, at) {
-            self.undo.push_back(self.snapshot());
-            while self.undo.len() > self.undo_limit {
-                self.undo.pop_front();
-            }
-        }
-        self.redo.clear();
+        let before = (!joins_group(self.last_edit, kind, at)).then(|| self.snapshot());
+        self.history.record(before);
     }
 
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(point) = self.undo.pop_back() else {
-            return;
-        };
-        self.redo.push(self.snapshot());
-        self.restore(point, cx);
+        let current = self.snapshot();
+        if let Some(point) = self.history.undo(|| current) {
+            self.restore(point, cx);
+        }
     }
 
     fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(point) = self.redo.pop() else {
-            return;
-        };
-        self.undo.push_back(self.snapshot());
-        self.restore(point, cx);
+        let current = self.snapshot();
+        if let Some(point) = self.history.redo(|| current) {
+            self.restore(point, cx);
+        }
     }
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -893,6 +875,20 @@ impl TextField {
         } else {
             self.selected_range.end
         }
+    }
+
+    /// The row height every mapping between a screen point and a byte offset
+    /// walks by: this field's own, which is what its shaped lines were laid
+    /// out at — see [`TextField::render`], which sets it on the box.
+    ///
+    /// Never `window.line_height()`. That answers for whatever text style is
+    /// current, and outside this field's own paint there is none of it on the
+    /// stack — a click handler is told the window's default instead. Walk the
+    /// rows at that stride and the caret lands a line or two above the one
+    /// under the pointer, further out the lower you click, until the last
+    /// lines of a full box cannot be reached at all.
+    fn line_height(&self) -> Pixels {
+        px(self.metrics.line_height())
     }
 
     /// Where the shaped text starts on screen: the box, moved up by the scroll.
@@ -927,20 +923,16 @@ impl TextField {
         cx.notify()
     }
 
-    fn offset_from_utf16(&self, offset: usize) -> usize {
-        offset_from_utf16(&self.content, offset)
-    }
-
     fn offset_to_utf16(&self, offset: usize) -> usize {
         offset_to_utf16(&self.content, offset)
     }
 
     fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
-        self.offset_to_utf16(range.start)..self.offset_to_utf16(range.end)
+        range_to_utf16(&self.content, range.clone())
     }
 
     fn range_from_utf16(&self, range_utf16: &Range<usize>) -> Range<usize> {
-        self.offset_from_utf16(range_utf16.start)..self.offset_from_utf16(range_utf16.end)
+        range_from_utf16(&self.content, range_utf16.clone())
     }
 
     fn previous_boundary(&self, offset: usize) -> usize {
@@ -983,6 +975,28 @@ pub fn offset_to_utf16(text: &str, offset: usize) -> usize {
         utf16_offset += ch.len_utf16();
     }
     utf16_offset
+}
+
+/// Platform range → byte range, clamped to character boundaries in `text`.
+pub fn range_from_utf16(text: &str, range: Range<usize>) -> Range<usize> {
+    offset_from_utf16(text, range.start)..offset_from_utf16(text, range.end)
+}
+
+/// Byte range → platform range.
+pub fn range_to_utf16(text: &str, range: Range<usize>) -> Range<usize> {
+    offset_to_utf16(text, range.start)..offset_to_utf16(text, range.end)
+}
+
+/// An IME selection is relative to the replacement text, not the document.
+pub fn composition_selection(
+    text: &str,
+    start: usize,
+    selection: Option<Range<usize>>,
+) -> Range<usize> {
+    let range = selection
+        .map(|range| range_from_utf16(text, range))
+        .unwrap_or(text.len()..text.len());
+    start + range.start..start + range.end
 }
 
 /// Previous *grapheme* boundary, so arrow keys and backspace step over a flag
@@ -1250,7 +1264,7 @@ impl EntityInputHandler for TextField {
         // Every edit lands here — typing, deleting, cut, paste, and the IME
         // *committing*. Not `replace_and_mark_text_in_range`, which is the
         // composing path: provisional text must not become undo steps, or every
-        // keystroke of Japanese input would be one.
+        // keystroke of Chinese input would be one.
         let kind = if new_text.is_empty() {
             EditKind::Delete
         } else {
@@ -1297,11 +1311,9 @@ impl EntityInputHandler for TextField {
                 .into();
         self.marked_range =
             (!new_text.is_empty()).then(|| range.start..range.start + new_text.len());
-        self.selected_range = new_selected_range_utf16
-            .as_ref()
-            .map(|range_utf16| self.range_from_utf16(range_utf16))
-            .map(|new_range| new_range.start + range.start..new_range.end + range.end)
-            .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
+        self.selected_range =
+            composition_selection(new_text, range.start, new_selected_range_utf16);
+        self.selection_reversed = false;
 
         self.caret_moved();
         cx.emit(FieldEvent::Changed);
@@ -1312,7 +1324,7 @@ impl EntityInputHandler for TextField {
         &mut self,
         range_utf16: Range<usize>,
         bounds: Bounds<Pixels>,
-        window: &mut Window,
+        _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let range = self.range_from_utf16(&range_utf16);
@@ -1320,18 +1332,18 @@ impl EntityInputHandler for TextField {
         // row that text is on, not the whole field. `bounds` is what
         // `last_bounds` is set from, so this is the same origin
         // [`TextField::offset_bounds`] measures from.
-        self.row_bounds(bounds.origin - self.scroll, range, window.line_height())
+        self.row_bounds(bounds.origin - self.scroll, range, self.line_height())
     }
 
     fn character_index_for_point(
         &mut self,
         point: Point<Pixels>,
-        window: &mut Window,
+        _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
         self.last_bounds?.localize(&point)?;
         let origin = self.text_origin()?;
-        let offset = offset_for_position(&self.last_layout, point - origin, window.line_height());
+        let offset = offset_for_position(&self.last_layout, point - origin, self.line_height());
         Some(self.offset_to_utf16(offset))
     }
 }
@@ -1400,7 +1412,6 @@ impl Render for TextField {
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .w_full()
             .when(self.frame, |field| {
@@ -1469,8 +1480,10 @@ impl Element for TextFieldElement {
     ) -> (LayoutId, ()) {
         let mut style = Style::default();
         style.size.width = relative(1.).into();
-        let line_height = window.line_height();
         let field = self.field.read(cx);
+        // The field's own, here as everywhere: sizing the box off one height
+        // and hit-testing it at another is how a click lands on the wrong row.
+        let line_height = field.line_height();
         let shape = field.shape;
 
         let (min, max) = match shape {
@@ -1590,7 +1603,7 @@ impl Element for TextFieldElement {
         };
 
         let font_size = style.font_size.to_pixels(window.rem_size());
-        let line_height = window.line_height();
+        let line_height = field.line_height();
         // A single line never wraps: it scrolls sideways instead, so shaping it
         // against the field's width would fold it into rows nothing can reach.
         let wrap_width = shape.is_multiline().then_some(bounds.size.width);
@@ -1694,7 +1707,29 @@ impl Element for TextFieldElement {
             ElementInputHandler::new(bounds, self.field.clone()),
             cx,
         );
-        let line_height = window.line_height();
+        let line_height = self.field.read(cx).line_height();
+        // A drag that leaves the box is still a drag. `on_mouse_move` on the
+        // field's own div fires only while the box is the thing under the
+        // pointer, so a run dragged past the edge froze at the last character
+        // inside it — and the last line of a full box was unreachable, since
+        // reaching it means passing the edge. This is the window's own move,
+        // which arrives wherever the pointer went.
+        //
+        // Registered every frame because that is the contract: the listener is
+        // cleared with the frame that installed it.
+        let dragged = self.field.clone();
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
+            // The button being down is what makes this a drag. `is_selecting`
+            // is only cleared on the release, so a press whose release went
+            // somewhere we never heard about would otherwise leave a plain
+            // hover dragging the run around.
+            if phase != DispatchPhase::Bubble || !event.dragging() {
+                return;
+            }
+            dragged.update(cx, |field, cx| {
+                field.drag_to(event.position, line_height, cx);
+            });
+        });
         let lines = std::mem::take(&mut prepaint.lines);
         let selection = std::mem::take(&mut prepaint.selection);
         let cursor = prepaint.cursor.take();

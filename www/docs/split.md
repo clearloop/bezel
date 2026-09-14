@@ -24,10 +24,33 @@ div()
     .child(div().flex_1().child(right))
 ```
 
-The gesture stays with the caller because the fraction does. `split_handle` centres its line in a grab strip — the line plus 4px of slack each side, the same hitbox zed uses, because a 1px target is unhittable — and lights while `dragging`. The strip's width is `widgets::SPLIT_HANDLE_HIT`, for a caller laying out around it.
+The gesture stays with the caller because the fraction does.
 
-`SplitStyle::Ghost` takes the same drag and paints nothing, for a pane that already draws the edge itself. Two hairlines a pixel apart read as a seam rather than a divider.
+## API
 
-`axis_fraction`'s last argument is the dead zone: `0.15` here keeps either pane from being squeezed away, clamping the answer to `0.15..=0.85`. On a zero-extent container, the frame before layout has run, it returns the minimum rather than dividing by zero.
+```rust
+pub trait Layout: ThemeExt {
+    /// The line centred in a grab strip; `Line { dragging }` lights while held,
+    /// and `Ghost` takes the drag but paints nothing.
+    fn split_handle(&self, axis: gpui::Axis, style: SplitStyle) -> Div;
 
-`SplitDrag` is a distinct payload type so `on_drag_move::<SplitDrag>` on one container never fires for an unrelated split's gesture. `SliderDrag` exists for the same reason.
+    // ...
+}
+
+/// The strip's width: the line plus 4px of slack each side, since a 1px target
+/// is unhittable.
+pub const SPLIT_HANDLE_HIT: f32;
+
+/// A distinct payload, so `on_drag_move::<SplitDrag>` never fires for an
+/// unrelated split.
+pub struct SplitDrag;
+
+/// `min` is the dead zone — `0.15` clamps to `0.15..=0.85`. A zero-extent
+/// container answers `min` rather than dividing by zero.
+pub fn axis_fraction(
+    pointer: gpui::Point<gpui::Pixels>,
+    bounds: gpui::Bounds<gpui::Pixels>,
+    axis: gpui::Axis,
+    min: f32,
+) -> f32;
+```

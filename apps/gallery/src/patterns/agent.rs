@@ -29,7 +29,7 @@ use ui::{
     icons,
     input::{FieldEvent, Shape, TextField},
     loaders, popover,
-    scroll::{self, FollowState, ScrollbarState},
+    scroll::{self, Axes, FollowState, ScrollbarState},
     widgets,
     widgets::{ButtonStyle, Buttons, Layout, Status},
 };
@@ -216,10 +216,8 @@ impl Activity {
                     .relative()
                     .max_h(px(BOX_MAX))
                     .child(
-                        div()
-                            .id("reasoning")
+                        scroll::pane("reasoning", Axes::Vertical)
                             .max_h(px(BOX_MAX))
-                            .overflow_y_scroll()
                             .track_scroll(&self.scroll)
                             .child(div().flex().flex_col().gap(px(4.0)).pr(px(14.0)).children(
                                 REASONING.iter().take(self.shown()).map(|line| {
@@ -808,9 +806,9 @@ impl Composer {
     /// The picker, anchored at the `#` itself rather than under the card —
     /// `TextField::offset_bounds` is the same measurement the IME candidate
     /// panel anchors to, so it follows the caret down as the box grows.
-    fn picker(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn picker(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let hash = self.mention?;
-        let anchor = self.field.read(cx).offset_bounds(hash, window)?;
+        let anchor = self.field.read(cx).offset_bounds(hash)?;
         let rows: Vec<AnyElement> = self
             .filter
             .filtered()
@@ -854,10 +852,10 @@ impl gpui::Focusable for Composer {
 }
 
 impl Render for Composer {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
         let ready = !self.field.read(cx).content().trim().is_empty();
-        let picker = self.picker(&theme, window, cx);
+        let picker = self.picker(&theme, cx);
         let sent: Vec<AnyElement> = self
             .sent
             .iter()

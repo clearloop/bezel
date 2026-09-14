@@ -10,4 +10,15 @@ theme.avatar("TC")
 theme.avatar("K")
 ```
 
-One or two initials. There is no image variant: an avatar with a picture in it is `div().rounded_full().overflow_hidden()` around a gpui `img`, and the interesting part — where the image comes from, what happens while it loads, what happens when it fails — belongs to the app. This is the part that is always the same.
+No image variant: that is `div().rounded_full().overflow_hidden()` around a gpui `img`, and where the image comes from belongs to the app.
+
+## API
+
+```rust
+pub trait Content: ThemeExt {
+    /// One or two initials, 28px.
+    fn avatar(&self, initials: impl Into<SharedString>) -> Div;
+
+    // ...
+}
+```

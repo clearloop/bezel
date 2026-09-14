@@ -3,8 +3,6 @@ title: Table
 description: Columns declared once and handed to both the header and every row, so the two halves cannot drift apart.
 ---
 
-Reach for a table when the third column of every row has to line up, because reading *down* it is the point. Most lists of things are records, and a record reads better as a `group_box` of `card_row`s.
-
 ```rust
 use ui::table::{self, Align, Column, Width};
 
@@ -24,16 +22,55 @@ table::table(&theme)
     }))
 ```
 
-A header and a body that size their own cells drift apart the moment either changes, and nothing catches it — both halves look right on their own. So `row` zips its cells onto the same `Column` list the header used, and a cell is never sized where it is written. Cells shorter than columns is a bug in the caller: debug builds assert, release truncates rather than panicking at a user.
+Reach for a table when the third column of every row has to line up. Most lists of things are records, and a record reads better as a `group_box` of `card_row`s.
 
-`Width` is `Fixed(px)` or `Flex(share)` — a share of what is left after the fixed columns have taken theirs. `Align` is `Start` or `End`; there is no `Center`, because in a column of data it is almost always wrong and offering it is how tables end up with one. `Column::align_end()` is what a number wants, so its digits line up by place value rather than by however wide the last one was.
-
-Sorting is the caller's. `next_sort` says what a click means, the caller sorts its own rows, and the module paints the arrow:
+## Sorting
 
 ```rust
 let sort = table::next_sort(self.sort, column);
 ```
 
-The sorted column reverses; any other column starts ascending. Inheriting the previous column's direction would mean clicking a fresh heading can sort it descending, which reads as the table ignoring the click.
+The sorted column reverses; any other starts ascending. Inheriting the previous direction would let a fresh heading sort descending, which reads as the table ignoring the click.
+
+## API
+
+```rust
+// ui::table
+
+pub fn table(theme: &Theme) -> gpui::Div;
+pub fn header(theme: &Theme) -> gpui::Div;
+pub fn header_cell(theme: &Theme, column: &Column, sorted: Option<bool>) -> gpui::Div;
+
+/// Zips cells onto the same `Column` list the header used, so a cell is never
+/// sized where it is written. Too few cells asserts in debug, truncates in
+/// release rather than panicking at a user.
+pub fn row(
+    theme: &Theme,
+    columns: &[Column],
+    first: bool,
+    selected: bool,
+    cells: Vec<AnyElement>,
+) -> gpui::Div;
+
+pub enum Width {
+    Fixed(f32),
+    /// A share of what the fixed columns leave.
+    Flex(f32),
+}
+
+/// No `Center`: in a column of data it is almost always wrong.
+pub enum Align { Start, End }
+
+impl Column {
+    /// What a number wants, so digits line up by place value.
+    pub fn align_end(self) -> Self;
+
+    // ...
+}
+
+/// Says what a click means; the caller sorts its own rows and this paints the
+/// arrow. The sorted column reverses, any other starts ascending.
+pub fn next_sort(current: Option<Sort>, column: usize) -> Sort;
+```
 
 Nothing here holds data, so nothing here can hold it out of date.

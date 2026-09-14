@@ -3,8 +3,6 @@ title: Dialog
 description: A centred card over a dim scrim, with the dialog-in entrance and the scrim press handed in as a parameter.
 ---
 
-`modal` is the scrim and the layer; `dialog_card` and its pieces are what you put in it:
-
 ```rust
 use ui::popover;
 
@@ -25,10 +23,32 @@ popover::modal(
 )
 ```
 
-`viewport_size` is required: an `anchored` layer sizes to its children, so the scrim needs explicit dimensions to cover the window.
+The scrim press is a parameter rather than the caller's `.on_mouse_down_out`, because the scrim lives *inside* this deferred layer and nothing outside can reach it.
 
-The last argument is the scrim press, and it is a parameter rather than the caller's `.on_mouse_down_out` because the scrim lives *inside* this deferred layer — nothing outside can reach it. That is not hypothetical: the first version shipped without it, and what it looked like was a dialog that only closed on its own buttons.
+## API
 
-`modal_glass` is the variant for glass-tinted cards. Its scrim is lighter, because the standard dim buries the backdrop hue under the blur and the card comes out a flat grey slab next to the hue-inheriting menus. Its radius is not a parameter — a glass-tinted modal *is* a popover surface, and the parameter it used to take carried the doc line "must match the card's rounding", which is a footgun handed to the caller in writing.
+```rust
+// ui::popover
 
-The card enters over `DIALOG_IN`. Everything else — which buttons, what they do, whether `esc` closes it — is the caller's.
+/// `viewport` is required: an `anchored` layer sizes to its children, so the
+/// scrim needs explicit dimensions.
+pub fn modal(
+    id: impl Into<ElementId>,
+    viewport: gpui::Size<Pixels>,
+    card: AnyElement,
+    on_dismiss: impl Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
+) -> AnyElement;
+
+/// For glass-tinted cards. Lighter scrim — the standard dim buries the
+/// backdrop hue and the card comes out a flat grey slab.
+pub fn modal_glass(/* the same */) -> AnyElement;
+
+// The pieces to put in it.
+pub fn dialog_card(theme: &Theme) -> gpui::Div;
+pub fn dialog_title(theme: &Theme, title: impl Into<SharedString>) -> gpui::Div;
+pub fn dialog_body(theme: &Theme, copy: impl Into<SharedString>) -> gpui::Div;
+
+// ...
+```
+
+The card enters over `DIALOG_IN`. Which buttons, what they do and whether `esc` closes it are all the caller's.

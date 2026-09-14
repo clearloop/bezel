@@ -64,11 +64,16 @@ pub const CONTROL_KEY_CONTEXT: &str = "Control";
 /// ```
 pub const CLAIMS_TAB: &str = "ClaimsTab";
 
-/// Bind `tab` and `shift-tab`. Call once at startup.
+/// Install the bindings — [`bindings`], bound. Call once at startup.
+pub fn init(cx: &mut App) {
+    cx.bind_keys(bindings());
+}
+
+/// Traversal's keymap, as data, so an app can have it without having to
+/// take it — see [`crate::keys`] for layering over it or taking a chord
+/// away.
 ///
-/// Optional, like [`crate::input::init`] — the actions are public, so an app
-/// that wants different keys binds those instead. The bindings are global
-/// rather than scoped to a context: traversal is a property of the window, not
+/// `tab` and `shift-tab`, global rather than scoped to a context: traversal is a property of the window, not
 /// of whatever happens to be focused.
 ///
 /// Nothing in this crate claims `tab` for itself, deliberately. A multi-line
@@ -81,8 +86,9 @@ pub const CLAIMS_TAB: &str = "ClaimsTab";
 /// is the one. They
 /// carry no step: only the caller knows the range, and a library that picked
 /// one would be picking it for a percentage and a font size alike.
-pub fn init(cx: &mut App) {
-    cx.bind_keys([
+pub fn bindings() -> Vec<KeyBinding> {
+    let mut bindings = Vec::new();
+    bindings.extend([
         KeyBinding::new("tab", FocusNext, None),
         KeyBinding::new("shift-tab", FocusPrev, None),
         // Both, because both are standard and they disagree by platform: the
@@ -93,6 +99,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("left", Decrement, Some(CONTROL_KEY_CONTEXT)),
         KeyBinding::new("right", Increment, Some(CONTROL_KEY_CONTEXT)),
     ]);
+
+    bindings
 }
 
 /// Attach the traversal handlers, normally to the app's root element.
@@ -144,11 +152,8 @@ fn claims_tab(window: &Window) -> bool {
 /// every one of them a radius parameter, and would prise a focused tab off the
 /// hairline its underline has to overlap.
 ///
-/// Pressing dispatches [`Activate`], which the caller handles beside its
-/// `on_click`. Deliberately not folded into one callback: a control that is
-/// pressed by mouse and by key is doing the same thing, but only the caller
-/// knows what that is, and a keyboard-only affordance that silently diverges
-/// from the click is worse than none.
+/// Pressing dispatches [`Activate`]. Use [`pressable`] to route it and a click
+/// through one callback, or handle it separately for custom interaction.
 pub fn focusable(theme: &Theme, handle: &FocusHandle, el: Div) -> Div {
     // `tab_stop` writes through to the shared focus entry, so re-asserting it
     // every render is free and keeps the flag next to the element that wants
@@ -157,4 +162,30 @@ pub fn focusable(theme: &Theme, handle: &FocusHandle, el: Div) -> Div {
     el.key_context(CONTROL_KEY_CONTEXT)
         .track_focus(&handle)
         .focus_visible(|style| style.border_color(theme.ring))
+}
+
+/// One activation path for pointer and keyboard, with a shared enabled gate.
+/// The caller still owns the value changed by the callback.
+pub fn pressable(
+    theme: &Theme,
+    handle: &FocusHandle,
+    el: gpui::Stateful<Div>,
+    enabled: bool,
+    activate: impl Fn(&(), &mut Window, &mut App) + 'static,
+) -> gpui::Stateful<Div> {
+    let activate = std::rc::Rc::new(activate);
+    let click = activate.clone();
+    el.key_context(CONTROL_KEY_CONTEXT)
+        .track_focus(&handle.clone().tab_stop(enabled))
+        .focus_visible(|style| style.border_color(theme.ring))
+        .on_click(move |_, window, cx| {
+            if enabled {
+                click(&(), window, cx);
+            }
+        })
+        .on_action(move |_: &Activate, window, cx| {
+            if enabled {
+                activate(&(), window, cx);
+            }
+        })
 }
