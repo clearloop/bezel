@@ -1,7 +1,7 @@
 //! The canvas inside a host that does `ui::focus` traversal, the way an app
 //! root does.
 
-use canvas::{Canvas, CanvasView};
+use canvas::{Canvas, CanvasView, layout};
 use gpui::{
     AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement, Modifiers,
     MouseButton, ParentElement as _, Render, Styled as _, TestAppContext, VisualTestContext,
@@ -28,7 +28,7 @@ fn open(json: &str, cx: &mut TestAppContext) -> (Entity<CanvasView>, VisualTestC
     });
     let canvas = Canvas::parse(json).unwrap();
     let window = cx.add_window(|_, cx| Host {
-        canvas: cx.new(|cx| CanvasView::new(canvas, cx)),
+        canvas: cx.new(|cx| CanvasView::new(canvas, layout::MINDMAP, cx)),
         focus: cx.focus_handle(),
     });
     let host = window.root(cx).unwrap();
@@ -59,13 +59,16 @@ fn a_click_focuses_and_tab_adds_a_node(cx: &mut TestAppContext) {
     );
     cx.simulate_keystrokes("tab");
     cx.run_until_parked();
-    assert_eq!(cx.update(|_, cx| view.read(cx).canvas().nodes.len()), 1);
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).editor().canvas().nodes.len()),
+        1
+    );
 }
 
 #[gpui::test]
 fn dragging_the_background_pans(cx: &mut TestAppContext) {
     let (view, mut cx) = open("{}", cx);
-    let before = cx.update(|_, cx| view.read(cx).pan());
+    let before = cx.update(|_, cx| view.read(cx).editor().pan());
     cx.simulate_mouse_down(
         point(px(100.0), px(100.0)),
         MouseButton::Left,
@@ -81,6 +84,6 @@ fn dragging_the_background_pans(cx: &mut TestAppContext) {
         MouseButton::Left,
         Modifiers::none(),
     );
-    let after = cx.update(|_, cx| view.read(cx).pan());
+    let after = cx.update(|_, cx| view.read(cx).editor().pan());
     assert_eq!((after.x - before.x, after.y - before.y), (50.0, 30.0));
 }

@@ -1,7 +1,7 @@
 //! A mindmap on the canvas, with the JSON Canvas file a save would write
 //! beside it.
 //!
-//! The `session` node is an app's own kind: [`SESSION`] paints fields the spec
+//! The `session` node is an app's own kind: [`session_kind`] paints fields the spec
 //! does not name, edits its title in place, and makes a text note under it by
 //! `tab`. The page keeps its root through `with_changes`.
 //!
@@ -11,9 +11,10 @@
 //! is the entry point its chord takes. Copy this file.
 
 use canvas::{
-    Arrange, Canvas, CanvasView, Change,
+    Canvas, CanvasView, Change, Kinds, Snap, change,
     drag::{self, DragHandler},
-    kind::{self, Chrome, Field, Kind, Sizing},
+    kind::{self, Chrome, Field, Kind, Look},
+    layout::{self, Layout},
     mindmap,
     model::Node,
 };
@@ -59,16 +60,9 @@ const SOURCE: &str = r##"{
 const ROOT: &str = "root";
 
 /// Installed with `canvas::set_kinds` under `"session"`.
-pub const SESSION: Kind = Kind {
-    render: session,
-    sizing: Sizing::Fixed,
-    chrome: Chrome::Card,
-    edit: Some(Field {
-        read: title,
-        write: set_title,
-    }),
-    child: kind::blank,
-};
+pub fn session_kind() -> Kind {
+    Kind::new(session).edit(Field::new(title, set_title))
+}
 
 fn title(node: &Node) -> String {
     node.extra
@@ -82,21 +76,22 @@ fn set_title(node: &mut Node, title: String) {
     node.extra.insert("title".into(), title.into());
 }
 
-fn session(node: &Node, zoom: f32, _: &mut Window, cx: &mut App) -> AnyElement {
+fn session(node: &Node, look: Look, _: &mut Window, cx: &mut App) -> AnyElement {
     let theme = Theme::of(cx);
+    let zoom = look.zoom;
     let turns = node
         .extra
         .get("turns")
         .and_then(|turns| turns.as_u64())
         .unwrap_or_default();
-    div()
-        .flex()
-        .flex_col()
-        .child(
-            canvas::text_style(div(), TextStyle::Headline, zoom)
-                .text_color(theme.text)
-                .child(title(node)),
-        )
+    let title = look.editor.unwrap_or_else(|| {
+        canvas::text_style(div(), TextStyle::Headline, zoom)
+            .text_color(theme.text)
+            .child(title(node))
+            .into_any_element()
+    });
+    kind::chrome(Chrome::Card, node, zoom, cx)
+        .child(title)
         .child(
             canvas::text_style(div(), TextStyle::Callout, zoom)
                 .text_color(theme.text_muted)
@@ -145,6 +140,53 @@ impl DragMode {
     }
 }
 
+/// Who places the nodes, as the toolbar offers it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LayoutMode {
+    Free,
+    Mindmap,
+    Balanced,
+    Down,
+}
+
+impl LayoutMode {
+    const ALL: [(Self, &'static str, &'static [u8], &'static str); 4] = [
+        (
+            Self::Free,
+            "free",
+            icons::glyph::LayoutGrid,
+            "Free — nodes stay where they are put, arrows find the nearest",
+        ),
+        (
+            Self::Mindmap,
+            "mindmap",
+            icons::glyph::ListTree,
+            "Mindmap — the tree grows right",
+        ),
+        (
+            Self::Balanced,
+            "balanced",
+            icons::glyph::Split,
+            "Balanced — the root's branches split both ways",
+        ),
+        (
+            Self::Down,
+            "down",
+            icons::glyph::Network,
+            "Down — the tree grows downward",
+        ),
+    ];
+
+    fn layout(self) -> Layout {
+        match self {
+            Self::Free => layout::FREE,
+            Self::Mindmap => layout::MINDMAP,
+            Self::Balanced => layout::BALANCED,
+            Self::Down => layout::DOWN,
+        }
+    }
+}
+
 /// A new node of the page's two kinds, before the canvas gives it an id and a
 /// place.
 fn fresh(session: bool) -> Node {
@@ -169,23 +211,29 @@ pub struct CanvasDemo {
     view: Entity<CanvasView>,
     scroll: ScrollHandle,
     drag: DragMode,
+    layout: LayoutMode,
+    snap: bool,
 }
 
 impl CanvasDemo {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let canvas = Canvas::parse(SOURCE).expect("the sample is a canvas");
         let view = cx.new(|cx| {
-            CanvasView::new(canvas, cx).with_changes(|_, change, _| match &change {
-                // The page keeps its root.
-                Change::Remove { id } if id == ROOT => None,
-                _ => Some(change),
-            })
+            CanvasView::new(canvas, layout::MINDMAP, cx)
+                .with_kinds(Kinds::new().with("session", session_kind()))
+                .with_changes(|_, change| match &change {
+                    // The page keeps its root.
+                    Change::RemoveNodes { ids } if ids.iter().any(|id| id == ROOT) => None,
+                    _ => Some(change),
+                })
         });
         cx.observe(&view, |_, _, cx| cx.notify()).detach();
         Self {
             view,
             scroll: ScrollHandle::new(),
             drag: DragMode::Move,
+            layout: LayoutMode::Mindmap,
+            snap: false,
         }
     }
 
@@ -201,19 +249,19 @@ impl CanvasDemo {
     fn add(&mut self, session: bool, cx: &mut Context<Self>) {
         self.view.update(cx, |view, cx| {
             let node = fresh(session);
-            let change = match view.selected().map(str::to_owned) {
-                Some(parent) => mindmap::child(view.canvas(), &parent, node),
+            let changes = match view.editor().selected().map(str::to_owned) {
+                Some(parent) => mindmap::child(view.editor().canvas(), &parent, node),
                 None => {
-                    let (x, y) = view.center();
+                    let (x, y) = view.editor().center();
                     let at = (x - node.width / 2, y - node.height / 2);
-                    Some(mindmap::root(view.canvas(), node, at))
+                    Some(vec![mindmap::root(view.editor().canvas(), node, at)])
                 }
             };
-            if let Some(change) = change {
-                let id = change.id().to_owned();
-                if view.submit(change, cx) {
-                    view.select(Some(id), cx);
-                }
+            if let Some(changes) = changes
+                && let Some(id) = change::added(&changes).map(str::to_owned)
+                && view.update_editor(cx, |editor| editor.submit(changes))
+            {
+                view.update_editor(cx, |editor| editor.select(Some(id)));
             }
         });
     }
@@ -221,8 +269,12 @@ impl CanvasDemo {
     fn toolbar(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
         let painter = Painter::of(cx);
         let view = self.view.read(cx);
-        let removable = view.selected().is_some_and(|id| id != ROOT);
-        let (auto, zoom) = (view.arrange() == Arrange::Mindmap, view.zoom());
+        let removable = view.editor().selected().is_some_and(|id| id != ROOT);
+        let (zoom, can_undo, can_redo) = (
+            view.editor().zoom(),
+            view.editor().can_undo(),
+            view.editor().can_redo(),
+        );
         let button = |key: &'static str, glyph: &'static [u8]| {
             theme
                 .icon_button(
@@ -279,10 +331,37 @@ impl CanvasDemo {
                     ))
                     .when(removable, |button| {
                         button.on_click(cx.listener(|this, _, window, cx| {
-                            this.view.update(cx, |view, cx| view.remove_selected(cx));
+                            this.view.update(cx, |view, cx| {
+                                view.update_editor(cx, |editor| editor.remove_selected())
+                            });
                             this.refocus(window, cx);
                         }))
                     }),
+            );
+
+        let history = theme
+            .control_group()
+            .child(
+                button("undo", icons::glyph::Undo2)
+                    .when(!can_undo, |button| button.opacity(0.4))
+                    .tooltip(chord("Undo", Box::new(canvas::keys::Undo)))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.view.update(cx, |view, cx| {
+                            view.update_editor(cx, |editor| editor.undo())
+                        });
+                        this.refocus(window, cx);
+                    })),
+            )
+            .child(
+                button("redo", icons::glyph::Redo2)
+                    .when(!can_redo, |button| button.opacity(0.4))
+                    .tooltip(chord("Redo", Box::new(canvas::keys::Redo)))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.view.update(cx, |view, cx| {
+                            view.update_editor(cx, |editor| editor.redo())
+                        });
+                        this.refocus(window, cx);
+                    })),
             );
 
         let drags =
@@ -293,26 +372,49 @@ impl CanvasDemo {
                         .tooltip(tip(text))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.drag = mode;
-                            this.view
-                                .update(cx, |view, _| view.set_drag(mode.handler()));
+                            this.view.update(cx, |view, cx| {
+                                view.update_editor(cx, |editor| editor.set_drag(mode.handler()))
+                            });
                             this.refocus(window, cx);
                             cx.notify();
                         }))
                 }));
 
-        let layout = theme.control_group().child(
-            lit(button("auto-layout", icons::glyph::Network), auto)
+        let layouts =
+            theme
+                .control_group()
+                .children(LayoutMode::ALL.map(|(mode, key, glyph, text)| {
+                    lit(button(key, glyph), self.layout == mode)
+                        .tooltip(tip(text))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.layout = mode;
+                            this.view.update(cx, |view, cx| {
+                                view.update_editor(cx, |editor| editor.set_layout(mode.layout()))
+                            });
+                            this.refocus(window, cx);
+                            cx.notify();
+                        }))
+                }));
+
+        let snapping = theme.control_group().child(
+            lit(button("snap", icons::glyph::Grip), self.snap)
                 .tooltip(tip(
-                    "Auto layout — keep the tree arranged. Off, nodes stay where they are",
+                    "Snap — to a grid of 20, and to the lines other nodes share",
                 ))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    let to = if auto {
-                        Arrange::Free
-                    } else {
-                        Arrange::Mindmap
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.snap = !this.snap;
+                    let snap = match this.snap {
+                        true => Snap {
+                            grid: Some(20),
+                            guides: true,
+                        },
+                        false => Snap::default(),
                     };
-                    this.view.update(cx, |view, cx| view.set_arrange(to, cx));
+                    this.view.update(cx, |view, cx| {
+                        view.update_editor(cx, |editor| editor.set_snap(snap))
+                    });
                     this.refocus(window, cx);
+                    cx.notify();
                 })),
         );
 
@@ -322,7 +424,9 @@ impl CanvasDemo {
                 button("zoom-out", icons::glyph::ZoomOut)
                     .tooltip(chord("Zoom out", Box::new(canvas::keys::ZoomOut)))
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.view.update(cx, |view, cx| view.zoom_out(cx));
+                        this.view.update(cx, |view, cx| {
+                            view.update_editor(cx, |editor| editor.zoom_out())
+                        });
                         this.refocus(window, cx);
                     })),
             )
@@ -340,15 +444,18 @@ impl CanvasDemo {
                 button("zoom-in", icons::glyph::ZoomIn)
                     .tooltip(chord("Zoom in", Box::new(canvas::keys::ZoomIn)))
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.view.update(cx, |view, cx| view.zoom_in(cx));
+                        this.view.update(cx, |view, cx| {
+                            view.update_editor(cx, |editor| editor.zoom_in())
+                        });
                         this.refocus(window, cx);
                     })),
             )
             .child(
                 button("fit", icons::glyph::Scan)
-                    .tooltip(tip("Fit — centre the document again"))
+                    .tooltip(chord("Fit the whole document", Box::new(canvas::keys::Fit)))
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.view.update(cx, |view, cx| view.fit(cx));
+                        this.view
+                            .update(cx, |view, cx| view.update_editor(cx, |editor| editor.fit()));
                         this.refocus(window, cx);
                     })),
             );
@@ -365,6 +472,7 @@ impl CanvasDemo {
             .border_b_1()
             .border_color(theme.hairline(0.10))
             .child(add)
+            .child(history)
             .child(
                 div()
                     .flex()
@@ -373,7 +481,15 @@ impl CanvasDemo {
                     .child(caption("Drag"))
                     .child(drags),
             )
-            .child(layout)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(caption("Layout"))
+                    .child(layouts),
+            )
+            .child(snapping)
             .child(div().flex_1())
             .child(zooms)
     }
@@ -382,7 +498,7 @@ impl CanvasDemo {
 impl Render for CanvasDemo {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
-        let json = self.view.read(cx).canvas().to_json();
+        let json = self.view.read(cx).editor().canvas().to_json();
         div()
             .size_full()
             .flex()
@@ -393,7 +509,27 @@ impl Render for CanvasDemo {
                     .flex()
                     .flex_col()
                     .child(self.toolbar(&theme, cx))
-                    .child(div().flex_1().min_h_0().child(self.view.clone())),
+                    .child(
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_h_0()
+                            .child(self.view.clone())
+                            .child(
+                                div()
+                                    .absolute()
+                                    .right(px(12.0))
+                                    .bottom(px(12.0))
+                                    .w(px(160.0))
+                                    .h(px(110.0))
+                                    .rounded(px(8.0))
+                                    .border_1()
+                                    .border_color(theme.border)
+                                    .bg(theme.surface_card)
+                                    .overflow_hidden()
+                                    .child(canvas::minimap(&self.view, cx)),
+                            ),
+                    ),
             )
             .child(
                 scroll::pane("canvas-json", Axes::Vertical)
@@ -451,18 +587,22 @@ mod tests {
         let (demo, view, mut cx) = open(cx);
         cx.update(|_, cx| demo.update(cx, |demo, cx| demo.add(true, cx)));
         let added = cx
-            .update(|_, cx| view.read(cx).selected().map(str::to_owned))
+            .update(|_, cx| view.read(cx).editor().selected().map(str::to_owned))
             .expect("adding selects");
-        cx.update(|_, cx| view.update(cx, |view, cx| view.remove_selected(cx)));
-        assert!(cx.update(|_, cx| view.read(cx).canvas().node(&added).is_none()));
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.update_editor(cx, |editor| editor.remove_selected())
+            })
+        });
+        assert!(cx.update(|_, cx| view.read(cx).editor().canvas().node(&added).is_none()));
 
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
-                view.select(Some(ROOT.into()), cx);
-                view.remove_selected(cx);
+                view.update_editor(cx, |editor| editor.select(Some(ROOT.into())));
+                view.update_editor(cx, |editor| editor.remove_selected());
             })
         });
-        assert!(cx.update(|_, cx| view.read(cx).canvas().node(ROOT).is_some()));
+        assert!(cx.update(|_, cx| view.read(cx).editor().canvas().node(ROOT).is_some()));
     }
 
     fn click(at: Point<Pixels>, cx: &mut VisualTestContext) {
@@ -476,7 +616,7 @@ mod tests {
         let bounds = cx.update(|_, cx| view.read(cx).bounds()).expect("painted");
         assert!(bounds.size.height > px(100.0), "canvas is {bounds:?}");
         let at = bounds.origin + point(px(8.0), bounds.size.height - px(8.0));
-        let before = cx.update(|_, cx| view.read(cx).pan());
+        let before = cx.update(|_, cx| view.read(cx).editor().pan());
         cx.simulate_mouse_down(at, MouseButton::Left, Modifiers::none());
         cx.simulate_mouse_move(
             at + point(px(40.0), px(-20.0)),
@@ -488,14 +628,18 @@ mod tests {
             MouseButton::Left,
             Modifiers::none(),
         );
-        let after = cx.update(|_, cx| view.read(cx).pan());
+        let after = cx.update(|_, cx| view.read(cx).editor().pan());
         assert_eq!((after.x - before.x, after.y - before.y), (40.0, -20.0));
     }
 
     /// A node's middle, in window coordinates.
     fn middle(view: &CanvasView, id: &str) -> Point<Pixels> {
-        let (bounds, pan, zoom) = (view.bounds().expect("painted"), view.pan(), view.zoom());
-        let node = view.canvas().node(id).expect("the sample has it");
+        let (bounds, pan, zoom) = (
+            view.bounds().expect("painted"),
+            view.editor().pan(),
+            view.editor().zoom(),
+        );
+        let node = view.editor().canvas().node(id).expect("the sample has it");
         bounds.origin
             + point(
                 px(pan.x + (node.x + node.width / 2) as f32 * zoom),
@@ -508,30 +652,34 @@ mod tests {
         let (_, view, mut cx) = open(cx);
         let (at, zoom, origin) = cx.update(|_, cx| {
             let view = view.read(cx);
-            let node = view.canvas().node("keys").expect("the sample has it");
-            (middle(view, "keys"), view.zoom(), (node.x, node.y))
+            let node = view
+                .editor()
+                .canvas()
+                .node("keys")
+                .expect("the sample has it");
+            (middle(view, "keys"), view.editor().zoom(), (node.x, node.y))
         });
         let to = at + point(px(60.0), px(40.0));
         cx.simulate_mouse_down(at, MouseButton::Left, Modifiers::none());
-        let selected = cx.update(|_, cx| view.read(cx).selected().map(str::to_owned));
+        let selected = cx.update(|_, cx| view.read(cx).editor().selected().map(str::to_owned));
         assert_eq!(
             selected.as_deref(),
             Some("keys"),
             "the press missed the node"
         );
-        let pan = cx.update(|_, cx| view.read(cx).pan());
+        let pan = cx.update(|_, cx| view.read(cx).editor().pan());
         cx.simulate_mouse_move(to, MouseButton::Left, Modifiers::none());
         let (pan_after, mid) = cx.update(|_, cx| {
             let view = view.read(cx);
-            let node = view.canvas().node("keys").expect("still there");
-            (view.pan(), (node.x, node.y))
+            let node = view.editor().painted().node("keys").expect("still there");
+            (view.editor().pan(), (node.x, node.y))
         });
         assert_eq!(pan, pan_after, "the move panned instead");
         assert_ne!(mid, origin, "the move never reached the drag");
         cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::none());
         cx.run_until_parked();
         let node = cx
-            .update(|_, cx| view.read(cx).canvas().node("keys").cloned())
+            .update(|_, cx| view.read(cx).editor().canvas().node("keys").cloned())
             .expect("still there");
         let moved = ((60.0 / zoom).round() as i64, (40.0 / zoom).round() as i64);
         assert_eq!((node.x, node.y), (origin.0 + moved.0, origin.1 + moved.1));
@@ -542,7 +690,7 @@ mod tests {
     fn tab_adds_after_clicking_empty_space(cx: &mut TestAppContext) {
         let (_, view, mut cx) = open(cx);
         let bounds = cx.update(|_, cx| view.read(cx).bounds()).expect("painted");
-        let before = cx.update(|_, cx| view.read(cx).canvas().nodes.len());
+        let before = cx.update(|_, cx| view.read(cx).editor().canvas().nodes.len());
         click(
             bounds.origin + point(px(8.0), bounds.size.height - px(8.0)),
             &mut cx,
@@ -550,7 +698,7 @@ mod tests {
         cx.simulate_keystrokes("tab");
         cx.run_until_parked();
         assert_eq!(
-            cx.update(|_, cx| view.read(cx).canvas().nodes.len()),
+            cx.update(|_, cx| view.read(cx).editor().canvas().nodes.len()),
             before + 1
         );
     }
@@ -560,25 +708,33 @@ mod tests {
         let (_, view, mut cx) = open(cx);
         let at = cx.update(|_, cx| {
             let view = view.read(cx);
-            let (bounds, pan, zoom) = (view.bounds().expect("painted"), view.pan(), view.zoom());
-            let root = view.canvas().node("root").expect("the sample has a root");
+            let (bounds, pan, zoom) = (
+                view.bounds().expect("painted"),
+                view.editor().pan(),
+                view.editor().zoom(),
+            );
+            let root = view
+                .editor()
+                .canvas()
+                .node("root")
+                .expect("the sample has a root");
             bounds.origin
                 + point(
                     px(pan.x + (root.x + root.width / 2) as f32 * zoom),
                     px(pan.y + (root.y + root.height / 2) as f32 * zoom),
                 )
         });
-        let before = cx.update(|_, cx| view.read(cx).canvas().nodes.len());
+        let before = cx.update(|_, cx| view.read(cx).editor().canvas().nodes.len());
         click(at, &mut cx);
         assert_eq!(
-            cx.update(|_, cx| view.read(cx).selected().map(str::to_owned))
+            cx.update(|_, cx| view.read(cx).editor().selected().map(str::to_owned))
                 .as_deref(),
             Some("root")
         );
         cx.simulate_keystrokes("tab");
         cx.run_until_parked();
         assert_eq!(
-            cx.update(|_, cx| view.read(cx).canvas().nodes.len()),
+            cx.update(|_, cx| view.read(cx).editor().canvas().nodes.len()),
             before + 1
         );
     }
