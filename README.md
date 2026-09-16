@@ -4,10 +4,12 @@
 [![license](https://img.shields.io/crates/l/bezel.svg?style=flat-square)](LICENSE)
 [![gpui](https://img.shields.io/crates/v/bezel-gpui.svg?style=flat-square&label=gpui)](https://crates.io/crates/bezel-gpui)
 
+> [!NOTE]
+> Bezel is developing fast, with frequent releases and version bumps.
+> APIs are still evolving, so expect changes as the library takes shape.
+
 A gpui component library, SwiftUI-lean: style flows through the environment,
-never through parameters, and its numbers are measured rather than chosen — the
-type ladder is `NSFont.preferredFont(forTextStyle:)`, the gap between siblings
-is `NSStackView().spacing`. [CONTRIBUTING.md](CONTRIBUTING.md) has the laws.
+never through parameters.
 
 https://github.com/user-attachments/assets/34861f29-004f-47f0-89e6-42cc8772749f
 
@@ -15,6 +17,12 @@ https://github.com/user-attachments/assets/34861f29-004f-47f0-89e6-42cc8772749f
 use bezel::ui::widgets::{ButtonStyle, Buttons};
 theme.button("Save", ButtonStyle::Prominent, None)
 ```
+
+## Built with Bezel
+
+[Cydonia](https://github.com/crabtalk/cydonia) is a desktop workspace for working
+with coding agents in a project directory. It's a real app built with Bezel —
+explore it to see the library in use beyond the component gallery.
 
 ## Install
 
@@ -128,6 +136,7 @@ the bootstrap, the laws, and the traps that only bite at runtime.
 | Thinking orbs          | [gpui-thinking-orbs]               | MIT         |
 | Blob avatars           | [blobatar]                         | MIT         |
 | Syntax highlighting    | tree-sitter core and grammars      | MIT         |
+| Wasm grammar fixtures  | [tree-sitter-json], [tree-sitter-css] | MIT      |
 | TypeScript/TSX queries | [nvim-treesitter]                  | Apache-2.0  |
 | Icons                  | [Lucide], ported from a release    | ISC         |
 | Fonts                  | Geist and Geist Mono © Vercel Inc. | SIL OFL 1.1 |
@@ -137,4 +146,6 @@ the bootstrap, the laws, and the traps that only bite at runtime.
 [gpui-thinking-orbs]: https://github.com/FrancoEscob/gpui-thinking-orbs
 [blobatar]: https://github.com/Alain00/blobatar
 [nvim-treesitter]: https://github.com/nvim-treesitter/nvim-treesitter
+[tree-sitter-json]: https://github.com/tree-sitter/tree-sitter-json
+[tree-sitter-css]: https://github.com/tree-sitter/tree-sitter-css
 [lucide]: https://lucide.dev
