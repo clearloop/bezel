@@ -128,10 +128,10 @@ fn write_block(out: &mut String, kind: &BlockKind, indent: u8, marks: &Marks) {
     let pad = INDENT.repeat(indent as usize);
 
     match kind {
-        BlockKind::Paragraph(text) => write_lines(out, &pad, &pad, &inline(text, marks)),
+        BlockKind::Paragraph(text) => write_lines(out, &pad, &pad, &inline("", text, marks)),
         BlockKind::Heading { level, text } => {
             let hashes = "#".repeat((*level).clamp(1, 6) as usize);
-            write_lines(out, &format!("{pad}{hashes} "), &pad, &inline(text, marks));
+            write_lines(out, &format!("{pad}{hashes} "), &pad, &inline("", text, marks));
         }
         // A bullet with no text would be written as a line holding nothing but
         // a dash — and a line of dashes directly under a paragraph is a setext
@@ -150,7 +150,7 @@ fn write_block(out: &mut String, kind: &BlockKind, indent: u8, marks: &Marks) {
         }
         BlockKind::Quote(text) => {
             let prefix = format!("{pad}> ");
-            write_lines(out, &prefix, &prefix, &inline(text, marks));
+            write_lines(out, "", &prefix, &inline(&prefix, text, marks));
         }
         BlockKind::Code { language, code } => {
             let fence = "`".repeat(fence_width(&code.text));
@@ -224,7 +224,7 @@ fn write_marked(out: &mut String, pad: &str, marker: &str, text: &Text, marks: &
     };
     let first = format!("{pad}{opener}");
     let rest = format!("{pad}{}", " ".repeat(marker.chars().count()));
-    write_lines(out, &first, &rest, &inline(text, marks));
+    write_lines(out, &first, &rest, &inline("", text, marks));
 }
 
 fn write_lines(out: &mut String, first: &str, rest: &str, body: &str) {
@@ -263,7 +263,7 @@ fn write_table(
             line.push(' ');
             if let Some(cell) = cells.get(ix) {
                 // `escape_span` already escapes the pipes.
-                line.push_str(&inline(cell, marks));
+                line.push_str(&inline("", cell, marks));
             }
             line.push_str(" |");
         }
@@ -292,7 +292,7 @@ fn write_table(
 /// Render inline content with its marks. Marks are stored outermost first, so
 /// opening them in order and closing them in reverse reproduces the nesting —
 /// which is what keeps `**_x_**` and `_**x**_` distinct.
-fn inline(text: &Text, marks: &Marks) -> String {
+fn inline(prefix: &str, text: &Text, marks: &Marks) -> String {
     let mut out = String::new();
     let mut open: Vec<usize> = Vec::new();
     let mut started = vec![false; text.marks.len()];
@@ -308,6 +308,8 @@ fn inline(text: &Text, marks: &Marks) -> String {
         .collect();
     boundaries.sort_unstable();
     boundaries.dedup();
+
+    out.push_str(prefix);
 
     for point in boundaries {
         if point < cursor {
@@ -520,24 +522,26 @@ fn escape_inline(out: &mut String, s: &str, marks: &Marks) {
     // Note: 'out' doesn't have '> ' when processing quote body so backtracking to prove
     //       '> [!' is not possible, but trailing newline guarantees it's not link or image.
     let mut trimmed = s;
-    let len = s.len();
-    if len >= 7 {
-        let ascii = s.as_bytes();
-        if ascii[..7].eq_ignore_ascii_case(b"[!TIP]\n") {
-            out.push_str(&s[..7]);
-            trimmed = &trimmed[7..];
-        } else if len >= 8 && ascii[..8].eq_ignore_ascii_case(b"[!NOTE]\n") {
-            out.push_str(&s[..8]);
-            trimmed = &trimmed[8..];
-        } else if len >= 11
-            && (ascii[..11].eq_ignore_ascii_case(b"[!WARNING]\n")
-                || ascii[..11].eq_ignore_ascii_case(b"[!CAUTION]\n"))
-        {
-            out.push_str(&s[..11]);
-            trimmed = &trimmed[11..];
-        } else if len >= 13 && ascii[..13].eq_ignore_ascii_case(b"[!IMPORTANT]\n") {
-            out.push_str(&s[..13]);
-            trimmed = &trimmed[13..];
+    if out.len() == 2 && out == "> " {
+        let len = s.len();
+        if len >= 7 {
+            let ascii = s.as_bytes();
+            if ascii[..7].eq_ignore_ascii_case(b"[!TIP]\n") {
+                out.push_str(&s[..7]);
+                trimmed = &trimmed[7..];
+            } else if len >= 8 && ascii[..8].eq_ignore_ascii_case(b"[!NOTE]\n") {
+                out.push_str(&s[..8]);
+                trimmed = &trimmed[8..];
+            } else if len >= 11
+                && (ascii[..11].eq_ignore_ascii_case(b"[!WARNING]\n")
+                    || ascii[..11].eq_ignore_ascii_case(b"[!CAUTION]\n"))
+            {
+                out.push_str(&s[..11]);
+                trimmed = &trimmed[11..];
+            } else if len >= 13 && ascii[..13].eq_ignore_ascii_case(b"[!IMPORTANT]\n") {
+                out.push_str(&s[..13]);
+                trimmed = &trimmed[13..];
+            }
         }
     }
 
