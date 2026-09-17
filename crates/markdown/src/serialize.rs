@@ -522,7 +522,7 @@ fn escape_inline(out: &mut String, s: &str, marks: &Marks) {
 
     // GFM alerts support
     let mut trimmed = s;
-    if out.len() == 2 && out == "> " {
+    if out == "> " {
         let len = s.len();
         if len >= 7 {
             let ascii = s.as_bytes();
