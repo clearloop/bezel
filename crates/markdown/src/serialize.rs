@@ -150,6 +150,8 @@ fn write_block(out: &mut String, kind: &BlockKind, indent: u8, marks: &Marks) {
         }
         BlockKind::Quote(text) => {
             let prefix = format!("{pad}> ");
+            // Passing prefix as a inline text instead of block prefix
+            // to allow detecting GFM alerts accurately.
             write_lines(out, "", &prefix, &inline(&prefix, text, marks));
         }
         BlockKind::Code { language, code } => {
@@ -519,8 +521,6 @@ fn escape_inline(out: &mut String, s: &str, marks: &Marks) {
     let mut line_start = out.is_empty() || out.ends_with('\n');
 
     // GFM alerts support
-    // Note: 'out' doesn't have '> ' when processing quote body so backtracking to prove
-    //       '> [!' is not possible, but trailing newline guarantees it's not link or image.
     let mut trimmed = s;
     if out.len() == 2 && out == "> " {
         let len = s.len();
