@@ -43,6 +43,11 @@ const CANONICAL: &[&str] = &[
     "a #123 reference",
     "1 < 2 & 3 > 0",
     "- a\n\n    child paragraph",
+    "> [!TIP]\n> GFM alerts",
+    "> [!NOTE]\n> GFM alerts",
+    "> [!WARNING]\n> GFM alerts",
+    "> [!CAUTION]\n> GFM alerts",
+    "> [!IMPORTANT]\n> GFM alerts",
 ];
 
 /// Markdown that legitimately gets rewritten — escaping added, nesting
@@ -68,6 +73,11 @@ const NON_CANONICAL: &[&str] = &[
     "1. a\n\n    ```\n    code\n    ```",
     "",
     "\n\n\n",
+    "[!TIP](link)",
+    "![!NOTE](image)",
+    "[!WARNING]",
+    "[!CAUTION] GFM alerts",
+    "> [!IMPORTANT] GFM alerts",
 ];
 
 #[test]

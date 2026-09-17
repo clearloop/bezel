@@ -515,7 +515,33 @@ fn bare_destination(url: &str) -> bool {
 /// of a line in the *output*, not in the slice.
 fn escape_inline(out: &mut String, s: &str, marks: &Marks) {
     let mut line_start = out.is_empty() || out.ends_with('\n');
-    for (ix, line) in s.split('\n').enumerate() {
+
+    // GFM alerts support
+    // Note: 'out' doesn't have '> ' when processing quote body so backtracking to prove
+    //       '> [!' is not possible, but trailing newline guarantees it's not link or image.
+    let mut trimmed = s;
+    let len = s.len();
+    if len >= 7 {
+        let ascii = s.as_bytes();
+        if ascii[..7].eq_ignore_ascii_case(b"[!TIP]\n") {
+            out.push_str(&s[..7]);
+            trimmed = &trimmed[7..];
+        } else if len >= 8 && ascii[..8].eq_ignore_ascii_case(b"[!NOTE]\n") {
+            out.push_str(&s[..8]);
+            trimmed = &trimmed[8..];
+        } else if len >= 11
+            && (ascii[..11].eq_ignore_ascii_case(b"[!WARNING]\n")
+                || ascii[..11].eq_ignore_ascii_case(b"[!CAUTION]\n"))
+        {
+            out.push_str(&s[..11]);
+            trimmed = &trimmed[11..];
+        } else if len >= 13 && ascii[..13].eq_ignore_ascii_case(b"[!IMPORTANT]\n") {
+            out.push_str(&s[..13]);
+            trimmed = &trimmed[13..];
+        }
+    }
+
+    for (ix, line) in trimmed.split('\n').enumerate() {
         if ix > 0 {
             out.push('\n');
             line_start = true;
