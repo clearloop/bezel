@@ -56,10 +56,14 @@ use web_time::Instant;
 /// Shortest a thumb may get, however long the document — below this it stops
 /// being something a pointer can catch.
 pub const MIN_THUMB: Pixels = px(25.0);
-/// Space between the overlay track and the viewport edges.
-pub const BAR_INSET: Pixels = px(4.0);
+/// Space between the overlay track and the viewport edges, along the axis the
+/// bar runs.
+const INSET: f32 = 4.0;
+const BAR_INSET: Pixels = px(INSET);
 /// Width of the strip the thumb sits in.
 const TRACK: f32 = 10.0;
+/// Room a bar is centred in across its axis when the caller reserves none.
+const CHANNEL: f32 = 2.0 * INSET + TRACK;
 /// Width of the thumb itself, centred in the track.
 const THUMB: f32 = 6.0;
 /// Length of one [`rail`] mark, and its thickness.
@@ -71,7 +75,7 @@ const MARK_GAP: f32 = TRACK;
 /// How far the rail stands off the edge it is pinned to.
 const RAIL_INSET: f32 = 12.0;
 /// What a rail needs beside the content before it will paint at all.
-pub const RAIL_ROOM: f32 = RAIL_INSET + MARK;
+const RAIL_ROOM: f32 = RAIL_INSET + MARK;
 
 // ---------------------------------------------------------------------------
 // Pane — a scroll container whose axis is an argument, not a modifier
@@ -145,6 +149,45 @@ pub fn pane(id: impl Into<ElementId>, axes: Axes) -> Stateful<Div> {
     scrolls(div().id(id), axes)
 }
 
+/// [`pane`], keeping the wheel it can act on: the pane a consumer nests inside
+/// another and never wires a handle to.
+///
+/// [`claim_wheel`] asks the caller for a [`ScrollHandle`] and a [`ClaimState`],
+/// because the caller usually has the handle already — it is scrolling the pane
+/// from elsewhere. A bounded box inside someone else's page has neither, and a
+/// pane that is only ever read by the wheel that moves it should not make a
+/// consumer hold two fields to stop it dragging the page behind it. Both live
+/// in keyed element state here, so the pane is still one call.
+///
+/// ```ignore
+/// scroll::claiming_pane("output", Axes::Vertical, window, cx).child(text)
+/// ```
+///
+/// The chaining is [`claim_wheel`]'s: at its ends the pane hands the wheel back
+/// to the page.
+pub fn claiming_pane(
+    id: impl Into<ElementId>,
+    axes: Axes,
+    window: &mut Window,
+    cx: &mut App,
+) -> Stateful<Div> {
+    let id = id.into();
+    let held = window.use_keyed_state(id.clone(), cx, |_, _| Claiming::default());
+    let (handle, state) = {
+        let held = held.read(cx);
+        (held.handle.clone(), held.state.clone())
+    };
+    claim_wheel(pane(id, axes).track_scroll(&handle), &handle, axes, &state)
+}
+
+/// What [`claiming_pane`] keeps between frames: the handle it reads its own
+/// travel off, and where that travel stood before the wheel being dispatched.
+#[derive(Default)]
+struct Claiming {
+    handle: ScrollHandle,
+    state: ClaimState,
+}
+
 /// [`pane`]'s answer applied to an element that already exists — a container
 /// that scrolls only at some widths, or one another builder handed back.
 ///
@@ -186,6 +229,30 @@ pub fn contain_sideways<E: gpui::InteractiveElement>(el: E) -> E {
         // little of both into every gesture, and a mostly-vertical one still
         // belongs to the page.
         if delta.x.abs() > delta.y.abs() {
+            cx.stop_propagation();
+        }
+    })
+}
+
+/// Keep every wheel inside the pane it landed on — `overscroll-behavior:
+/// contain`, where [`claim_wheel`] is the chaining kind.
+///
+/// For a box with a cap on it, where the content is a program's output rather
+/// than a document: it is a window onto something, and a wheel over a window
+/// belongs to what is inside it. Chaining asks the pane to prove it moved,
+/// which it reads off a handle carrying the previous frame's layout — under a
+/// pane whose content is still arriving that reads as "did not move", and the
+/// page takes the wheel while the box is still scrolling (user report,
+/// DEV-13).
+///
+/// The page is still reachable: move the pointer off the box.
+pub fn contain_wheel<E: gpui::InteractiveElement>(el: E, axes: Axes) -> E {
+    el.on_scroll_wheel(move |event, window, cx| {
+        let delta = event.delta.pixel_delta(window.line_height());
+        // The dominant axis, as [`contain_sideways`] reads it: a trackpad puts
+        // a little of both into every gesture.
+        let sideways = delta.x.abs() > delta.y.abs();
+        if (sideways && axes.horizontal()) || (!sideways && axes.vertical()) {
             cx.stop_propagation();
         }
     })
@@ -339,6 +406,32 @@ impl ScrollbarState {
     }
 }
 
+/// Where a bar sits in the pane it reports on. [`Overlay`] builds one; the free
+/// bars take the default.
+#[derive(Clone, Copy)]
+struct Place {
+    /// Shortens the track at its far end.
+    end: Pixels,
+    /// Room reserved across the axis, which the track is centred in.
+    channel: Pixels,
+}
+
+impl Default for Place {
+    fn default() -> Self {
+        Self {
+            end: px(0.),
+            channel: px(CHANNEL),
+        }
+    }
+}
+
+impl Place {
+    /// Gap between the near edge of the pane and the near side of the track.
+    fn near(self) -> Pixels {
+        ((self.channel - px(TRACK)) * 0.5).max(px(0.))
+    }
+}
+
 /// The bar: an overlay strip along the right edge of whatever it is laid over,
 /// showing nothing at all when the content fits.
 ///
@@ -358,15 +451,16 @@ pub fn scrollbar(
     handle: &ScrollHandle,
     state: &ScrollbarState,
 ) -> gpui::AnyElement {
-    scrollbar_with_inset(id.into(), handle, state, px(0.))
+    scrollbar_placed(id.into(), handle, state, Place::default())
 }
 
-fn scrollbar_with_inset(
+fn scrollbar_placed(
     id: SharedString,
     handle: &ScrollHandle,
     state: &ScrollbarState,
-    end_inset: Pixels,
+    place: Place,
 ) -> gpui::AnyElement {
+    let end_inset = place.end;
     let viewport = handle.bounds().size.height;
     let max_offset = handle.max_offset().y;
     let Some(range) = thumb_in_track(
@@ -395,9 +489,14 @@ fn scrollbar_with_inset(
     div()
         .debug_selector(move || format!("{debug_id}-track"))
         .id(SharedString::from(format!("{id}-track")))
+        // A press on the bar belongs to the bar. Hitboxes in gpui are
+        // paint-order only, so without this the content under the strip takes
+        // the press as well; the wheel still passes, which is what a bar laid
+        // over a pane has to let through.
+        .block_mouse_except_scroll()
         .absolute()
         .top(BAR_INSET)
-        .right(BAR_INSET)
+        .right(place.near())
         .bottom(BAR_INSET + end_inset)
         .w(px(TRACK))
         .flex()
@@ -446,6 +545,12 @@ fn scrollbar_with_inset(
         .into_any_element()
 }
 
+/// Whether `room` beside the content is enough for a rail to paint in. A
+/// hand-rolled rail asks this to land on the same floor as [`rail`].
+pub fn rail_fits(room: Pixels) -> bool {
+    room >= px(RAIL_ROOM)
+}
+
 /// A mark per item, the one at the top of the viewport lit — for a pane whose
 /// content comes in countable pieces (a transcript's turns) rather than as one
 /// continuous document, where how far down you are matters less than which
@@ -459,15 +564,14 @@ fn scrollbar_with_inset(
 /// `.relative()` on whichever box the rail belongs to the edge of.
 ///
 /// `room` is the clear space beside the content, which only the caller can
-/// measure — the rail paints nothing under [`RAIL_ROOM`], because marks over
-/// the text would be worse than no marks at all.
+/// measure; under what [`rail_fits`] accepts the rail paints nothing.
 pub fn rail(
     id: impl Into<SharedString>,
     handle: &ScrollHandle,
     count: usize,
     room: Pixels,
 ) -> gpui::AnyElement {
-    if count == 0 || room < px(RAIL_ROOM) {
+    if count == 0 || !rail_fits(room) {
         return Empty.into_any_element();
     }
     let id = id.into();
@@ -540,16 +644,17 @@ pub fn transient(
     state: &TransientState,
     reduce_motion: bool,
 ) -> gpui::AnyElement {
-    transient_with_inset(id.into(), handle, state, reduce_motion, px(0.))
+    transient_placed(id.into(), handle, state, reduce_motion, Place::default())
 }
 
-fn transient_with_inset(
+fn transient_placed(
     id: SharedString,
     handle: &ScrollHandle,
     state: &TransientState,
     reduce_motion: bool,
-    end_inset: Pixels,
+    place: Place,
 ) -> gpui::AnyElement {
+    let end_inset = place.end;
     let viewport = handle.bounds().size.height;
     let max_offset = handle.max_offset().y;
     let Some(range) = thumb_in_track(
@@ -590,9 +695,14 @@ fn transient_with_inset(
     let track = div()
         .debug_selector(move || format!("{debug_id}-track"))
         .id(SharedString::from(format!("{id}-track")))
+        // A press on the bar belongs to the bar. Hitboxes in gpui are
+        // paint-order only, so without this the content under the strip takes
+        // the press as well; the wheel still passes, which is what a bar laid
+        // over a pane has to let through.
+        .block_mouse_except_scroll()
         .absolute()
         .top(BAR_INSET)
-        .right(BAR_INSET)
+        .right(place.near())
         .bottom(BAR_INSET + end_inset)
         .w(px(TRACK))
         .flex()
